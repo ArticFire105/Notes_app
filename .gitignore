@@ -1,0 +1,16 @@
+﻿.env
+.venv/
+data/
+__pycache__/
+*.pdf
+.ipynb_checkpoints/
+.pytest_cache/
+*.py[cod]
+
+# Downloaded models and tooling are reproducible, not project source.
+.cache/
+.huggingface/
+models/
+model_cache/
+sentence_transformers/
+.tools/

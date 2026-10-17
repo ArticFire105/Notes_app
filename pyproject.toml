@@ -1,0 +1,29 @@
+# Phase 0 dependencies support later ingestion and retrieval work.
+# uv manages the environment; application code is run from the repo root.
+[project]
+name = "lecture-notes-rag"
+version = "0.1.0"
+description = "Lecture-notes RAG for the CSE department at Manipal Dubai"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "MIT"
+dependencies = [
+    "psycopg[binary]",
+    "pgvector",
+    "pydantic-settings",
+    "pypdf",
+    "langchain-text-splitters",
+    "langchain-huggingface",
+    "sentence-transformers",
+    "langchain",
+    "langchain-google-genai",
+    "pillow>=13.0.0",
+    "torchvision>=0.29.1",
+]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
