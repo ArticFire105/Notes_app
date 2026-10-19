@@ -20,7 +20,7 @@ Code must unwrap a secret only when a library needs its value.
 Never pass an unwrapped value to a print or logging call.
 Validation errors hide their input values for the same reason.
 
-Local embeddings are the only provider in this phase.
+Local embeddings are the only implemented provider in this phase.
 The model identifier comes directly from the project plan.
 The fixed dimension matches the migration's vector column.
 A different dimension must fail before data can be ingested.
@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     google_api_key: SecretStr
     hf_token: SecretStr
 
-    embedding_provider: Literal["local"] = "local"
+    embedding_provider: Literal["local", "gemini"] = "local"
     embedding_model: str = "google/embeddinggemma-2"
     embedding_dim: int = 768
     chat_model: str = "google_genai:gemini-3.5-flash-lite"

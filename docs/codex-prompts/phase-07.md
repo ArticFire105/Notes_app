@@ -20,6 +20,7 @@ Add the library `pillow`.
    `AND (source_type = 'official' OR (source_type = 'student' AND owner_id = %s))` when on. Default off. Sources show a "📝 your notes" label.
 5. UI `frontend/pages/my_notes.py`: upload photos → show each transcription in an editable text area next to the image → "Save to my notes" → list of my notes with delete. On the subject chat page: a toggle "Include my handwritten notes".
 6. Tests: the SQL builder produces the right WHERE for both toggle states; `prepare_image` shrinks a big image.
+7. Images inside official notes (PDF now, PPTX later): during ingest, extract embedded images per page with `pypdf` (`page.images`), skip tiny ones (logos/icons, e.g. < 150 px), run each through `prepare_image` and a Gemini vision call: "Describe this lecture diagram/figure for a student in 2-4 sentences: what it shows, labels, and the flow." Store the caption as a chunk with the same page number, `source_type` kept from the document, and content prefixed `[Figure, page N]: ...`. Save the image to Storage so the UI can show it next to the answer. Cap captions per document (e.g. 30) and reuse `app/ocr.py`. Add a test that tiny images are skipped.
 
 Never let one student's notes appear in another student's answers. Write a test for that rule.
 

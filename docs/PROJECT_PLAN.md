@@ -948,6 +948,7 @@ Add the library `pillow`.
    `AND (source_type = 'official' OR (source_type = 'student' AND owner_id = %s))` when on. Default off. Sources show a "📝 your notes" label.
 5. UI `frontend/pages/my_notes.py`: upload photos → show each transcription in an editable text area next to the image → "Save to my notes" → list of my notes with delete. On the subject chat page: a toggle "Include my handwritten notes".
 6. Tests: the SQL builder produces the right WHERE for both toggle states; `prepare_image` shrinks a big image.
+7. Images inside official notes (PDF now, PPTX later): during ingest, extract embedded images per page with `pypdf` (`page.images`), skip tiny ones (logos/icons, e.g. < 150 px), run each through `prepare_image` and a Gemini vision call: "Describe this lecture diagram/figure for a student in 2-4 sentences: what it shows, labels, and the flow." Store the caption as a chunk with the same page number, `source_type` kept from the document, and content prefixed `[Figure, page N]: ...`. Save the image to Storage so the UI can show it next to the answer. Cap captions per document (e.g. 30) and reuse `app/ocr.py`. Add a test that tiny images are skipped.
 
 Never let one student's notes appear in another student's answers. Write a test for that rule.
 
@@ -1210,6 +1211,12 @@ Then run the `BETA_TEST.md` checklist with ~10 classmates.
 3. Which secrets go to the backend host, and which (if any) to the frontend host?
 
 ---
+
+
+**Plan additions (decided Oct 17, 2026)**
+- Phase 1: PDF first. At the END of Phase 1 add PPTX (`python-pptx`, text per slide, slide number as page) and DOCX (`python-docx`, paragraphs) readers that return the same `{page, text}` shape, so chunk/embed/store stay the same. Old `.ppt` must be converted to PPTX/PDF first.
+- Phase 7: captions for images/diagrams inside official notes (see Phase 7 task 7).
+- After Phase 8: "class tips" (things a teacher says in class, e.g. "this will surely come"), typed in by Rishi (later reps), stored as small documents with `source_type='class_tip'` plus subject and module. They boost quiz/likely-question predictions alongside past-paper repeats, and answers show a "Mentioned in class" badge.
 
 ### Later (after the prototype is approved)
 
