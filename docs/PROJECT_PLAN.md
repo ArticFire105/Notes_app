@@ -1,4 +1,4 @@
-# Notes App: Project Plan (Codex builds, Rishi learns)
+﻿# Notes App: Project Plan (Codex builds, Rishi learns)
 
 > A RAG app for lecture notes, for the CSE department at Manipal Dubai.
 > Codex writes the code one phase at a time. You read it, run it, test it, and explain it back.
@@ -1234,6 +1234,9 @@ Each of these becomes its own phase with its own prompt when you get there.
 | **Reps** | `role='rep'` + `year`/`school` → reps can upload only for their year's subjects. |
 | **Shared student notes** | `is_shared=true` + an admin approval step. |
 | **More BYOK providers** | `init_chat_model("openai:..." / "groq:...")` + a provider dropdown. Stored keys encrypted (Supabase Vault or Fernet) only if users ask. |
+| **Practice search agent** | ReAct agent (`create_agent`) with web search (e.g. Tavily) + YouTube Data API tools -> finds similar practice questions and YouTube videos for a doubt or past-paper question. |
+| **Local NVIDIA model** | Swap the Generate step to a Nemotron model (local via Ollama, or free hosted) with `init_chat_model`; compare with Gemini on the eval set. |
+| **Voice doubts mode** | Speak a doubt -> faster-whisper -> RAG answer -> TTS (e.g. Kokoro) speaks it back. |
 | **Direct image embeddings** | EmbeddingGemma 2 multimodal → search notes by image. An experiment; compare it with the Phase 9 approach. |
 | **Next.js frontend** | Only if Streamlit becomes the limit. |
 

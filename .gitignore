@@ -1,6 +1,10 @@
-﻿.env
+.env
 .venv/
-data/
+# Keep real notes and evaluation data private, but commit the format example.
+data/*
+!data/eval/
+data/eval/*
+!data/eval/questions.example.json
 __pycache__/
 *.pdf
 .ipynb_checkpoints/

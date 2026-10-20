@@ -60,6 +60,7 @@ class Settings(BaseSettings):
     embedding_model: str = "google/embeddinggemma-2"
     embedding_dim: int = 768
     chat_model: str = "google_genai:gemini-3.5-flash-lite"
+    max_output_tokens: int = 800
 
     @field_validator("embedding_dim")
     @classmethod
