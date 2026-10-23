@@ -24,12 +24,14 @@ class IngestError(ValueError):
 
 
 def ingest_pdf(
-    path: str | Path,
+    path: str | Path | bytes,
     subject_code: str,
     module_number: int,
     title: str,
     source_type: str = "official",
     replace: bool = False,
+    *,
+    document_id: UUID | None = None,
 ) -> UUID:
     started = perf_counter()
     title = title.strip()
@@ -70,29 +72,43 @@ def ingest_pdf(
             if scope is None:
                 raise IngestError("Subject/module not found; check the seed and module number.")
             subject_id, module_id = scope
-            cursor.execute(
-                "select id from documents where module_id = %s and title = %s",
-                (module_id, title),
-            )
-            if cursor.fetchone() is not None:
-                if not replace:
-                    raise IngestError("A document with this module and title exists; use --replace.")
-                # Deletion stays in the insert transaction, so a failure also
-                # restores the old document and its cascade-deleted chunks.
+            if document_id is not None:
+                # The API committed this row before scheduling background ingestion.
                 cursor.execute(
-                    "delete from documents where module_id = %s and title = %s",
+                    """
+                    select id from documents
+                    where id = %s and subject_id = %s and module_id = %s
+                      and source_type = %s and status = 'processing'
+                    for update
+                    """,
+                    (document_id, subject_id, module_id, source_type),
+                )
+                if cursor.fetchone() is None:
+                    raise IngestError("Processing document not found in this scope.")
+            else:
+                cursor.execute(
+                    "select id from documents where module_id = %s and title = %s",
                     (module_id, title),
                 )
-            cursor.execute(
-                """
-                insert into documents
-                    (subject_id, module_id, source_type, title, status, page_count)
-                values (%s, %s, %s, %s, 'ready', %s)
-                returning id
-                """,
-                (subject_id, module_id, source_type, title, page_count),
-            )
-            document_id = cursor.fetchone()[0]
+                if cursor.fetchone() is not None:
+                    if not replace:
+                        raise IngestError("A document with this module and title exists; use --replace.")
+                    # Deletion stays in the insert transaction, so a failure also
+                    # restores the old document and its cascade-deleted chunks.
+                    cursor.execute(
+                        "delete from documents where module_id = %s and title = %s",
+                        (module_id, title),
+                    )
+                cursor.execute(
+                    """
+                    insert into documents
+                        (subject_id, module_id, source_type, title, status, page_count)
+                    values (%s, %s, %s, %s, 'ready', %s)
+                    returning id
+                    """,
+                    (subject_id, module_id, source_type, title, page_count),
+                )
+                document_id = cursor.fetchone()[0]
             cursor.executemany(
                 """
                 insert into chunks
@@ -108,6 +124,12 @@ def ingest_pdf(
                     )
                     for chunk, vector in zip(chunks, vectors, strict=True)
                 ],
+            )
+
+            # Publish readiness in the same transaction as the chunks.
+            cursor.execute(
+                "update documents set status = 'ready', error = null, page_count = %s where id = %s",
+                (page_count, document_id),
             )
 
     # Report success only after the connection context has committed all rows.

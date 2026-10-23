@@ -151,3 +151,67 @@ def test_cli_does_not_expose_external_exception(monkeypatch, capsys):
     output = capsys.readouterr()
     assert "FAIL ingestion" in output.err
     assert "dummy-secret" not in output.out + output.err
+
+
+def test_byte_loader_preserves_original_page_numbers(monkeypatch):
+    texts = ["A full explanation of paging from the lecture.", "", "A full explanation of page tables."]
+    reader = SimpleNamespace(pages=[
+        SimpleNamespace(extract_text=lambda text=text: text) for text in texts
+    ])
+    monkeypatch.setattr(pdf_loader, "PdfReader", lambda stream: reader)
+    pages, skipped = pdf_loader.load_pdf_pages(b"dummy PDF bytes")
+    assert [page["page"] for page in pages] == [1, 3]
+    assert skipped == 1
+
+
+def test_existing_document_ingestion_reuses_row_and_marks_ready(ingestion):
+    ingestion.cursor.fetchone.side_effect = [(1, 2), (ingestion.document_id,)]
+    result = pipeline.ingest_pdf(
+        b"dummy PDF bytes", "OS", 2, "Memory", document_id=ingestion.document_id
+    )
+    assert result == ingestion.document_id
+    calls = ingestion.cursor.execute.call_args_list
+    assert not any("insert into documents" in call.args[0] for call in calls)
+    assert calls[1].args[1] == (result, 1, 2, "official")
+    assert "status = 'processing'" in calls[1].args[0]
+    assert "status = 'ready'" in calls[-1].args[0]
+    assert calls[-1].args[1] == (2, result)
+    assert ingestion.cursor.executemany.call_args.args[1][0][0] == result
+    ingestion.context.return_value.__exit__.assert_called_once_with(None, None, None)
+
+
+def test_existing_document_scope_mismatch_prevents_chunk_writes(ingestion):
+    ingestion.cursor.fetchone.side_effect = [(1, 2), None]
+    with pytest.raises(pipeline.IngestError, match="Processing document not found"):
+        pipeline.ingest_pdf(
+            b"dummy PDF bytes", "OS", 2, "Memory", document_id=ingestion.document_id
+        )
+    ingestion.cursor.executemany.assert_not_called()
+
+
+def test_existing_document_chunk_failure_rolls_back_without_ready(ingestion):
+    ingestion.cursor.fetchone.side_effect = [(1, 2), (ingestion.document_id,)]
+    ingestion.cursor.executemany.side_effect = RuntimeError("dummy failure")
+    with pytest.raises(RuntimeError):
+        pipeline.ingest_pdf(
+            b"dummy PDF bytes", "OS", 2, "Memory", document_id=ingestion.document_id
+        )
+    assert ingestion.context.return_value.__exit__.call_args.args[0] is RuntimeError
+    assert not any(
+        "status = 'ready'" in call.args[0]
+        for call in ingestion.cursor.execute.call_args_list
+    )
+
+
+def test_cli_keeps_path_based_ingestion(monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", [
+        "ingest_pdf.py", "--pdf", "dummy.pdf", "--subject", "OS",
+        "--module", "2", "--title", "Memory", "--replace",
+    ])
+    ingest = MagicMock(return_value="dummy-document-id")
+    monkeypatch.setattr(cli, "ingest_pdf", ingest)
+    assert cli.main() == 0
+    assert str(ingest.call_args.args[0]) == "dummy.pdf"
+    assert ingest.call_args.args[1:] == ("OS", 2, "Memory")
+    assert ingest.call_args.kwargs == {"replace": True}
+    assert "PASS ingestion" in capsys.readouterr().out
