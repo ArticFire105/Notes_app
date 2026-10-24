@@ -4,10 +4,10 @@ The lifespan loads the cached embedder before serving requests.
 A fixed failure response prevents exception details leaking.
 Route functions keep blocking work in FastAPI worker threads.
 
-This module belongs to Phase 3 of the notes application.
+This module combines the Phase 3 API and Phase 4 authentication.
 The API wraps the existing ingestion and answering code.
-It runs locally until authentication is added in Phase 4.
-Do not deploy before Phase 4.
+Only the health endpoint allows anonymous access.
+Interactive API documentation routes are disabled.
 
 Database credentials stay on the backend.
 The Storage service role key stays on the backend.
@@ -29,19 +29,19 @@ Question answers reuse the Phase 2 answer function.
 Tests replace model loading and all external calls.
 Tests never need real credentials or a real dotenv file.
 
-No authentication, quota, cache, or frontend is added here.
+Authentication is required; quotas and the frontend come later.
 Run the API from the repository root.
 Use uv run pytest for the offline test suite.
 """
 
-# Do not deploy before Phase 4.
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.embeddings import get_embedder
-from app.routers import ask, documents, subjects
+from app.auth import get_current_user
+from app.routers import ask, documents, me, subjects
 
 
 @asynccontextmanager
@@ -54,7 +54,8 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Lecture Notes API", lifespan=lifespan)
+app = FastAPI(title="Lecture Notes API", lifespan=lifespan,
+              docs_url=None, redoc_url=None, openapi_url=None)
 
 
 @app.middleware("http")
@@ -71,7 +72,8 @@ def health():
     return {"status": "ok"}
 
 
-app.include_router(subjects.router)
-app.include_router(documents.router)
-app.include_router(ask.router)
+app.include_router(subjects.router, dependencies=[Depends(get_current_user)])
+app.include_router(documents.router, dependencies=[Depends(get_current_user)])
+app.include_router(ask.router, dependencies=[Depends(get_current_user)])
+app.include_router(me.router)
 

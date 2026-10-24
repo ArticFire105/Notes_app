@@ -84,3 +84,67 @@ A failed replacement restores the old document and its chunks. No PDF is uploade
 to Storage in this phase, so `storage_path` remains empty.
 
 Read [AGENTS.md](AGENTS.md) before contributing. Licensed under [MIT](LICENSE).
+
+## Login and roles (Phase 4)
+
+All API endpoints except `/health` now require a verified Supabase bearer token
+and a college email. Only an `admin` can upload official PDFs. The backend reads
+the role from `profiles` on every request; role changes take effect immediately.
+Token verification is cached for up to 60 seconds, never beyond token expiry.
+A revoked token can therefore continue working for up to 60 seconds.
+The interactive API documentation endpoints are disabled.
+
+Complete these steps by hand in Supabase:
+
+1. Run [0003_profiles_roles.sql](supabase/migrations/0003_profiles_roles.sql)
+   once in the SQL Editor, after `0001_init.sql`. It also creates profiles for
+   existing Auth users. Confirm RLS is enabled on all five public application
+   tables. The backend must keep using a trusted database connection.
+2. Under Authentication, enable the Email provider and allow new signups if
+   students should create accounts through OTP login. In the Magic Link email
+   template, include `{{ .Token }}` to send a code instead of a link.
+   See [Supabase's OTP instructions](https://supabase.com/docs/guides/auth/auth-email-passwordless).
+3. Configure custom SMTP before testing with addresses outside your Supabase
+   project team. The built-in sender only sends to team addresses and has a
+   low sending limit. See [Supabase's SMTP restrictions](https://supabase.com/docs/guides/auth/auth-smtp).
+4. Run the backend and OTP helper below. Confirm a profile appears with role
+   `student`. In the SQL Editor, replace the placeholder and run:
+
+   ```sql
+   update public.profiles set role = 'admin'
+   where email = 'YOUR_EMAIL@dxb.manipal.edu';
+   ```
+
+The new `ALLOWED_EMAIL_DOMAIN=dxb.manipal.edu` setting is in `.env.example`.
+It is also the default; add it to your own local configuration if desired.
+Never share credentials or tokens.
+
+Run the offline tests:
+
+```powershell
+uv run pytest
+```
+
+Start the API in one terminal:
+
+```powershell
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+In another terminal, check public health, rejected anonymous access, then OTP:
+
+```powershell
+curl.exe -i http://127.0.0.1:8000/health
+curl.exe -i http://127.0.0.1:8000/subjects
+uv run python scripts/get_token.py
+```
+
+Expect 200 for health, 401 for anonymous subjects, and email plus role after
+successful OTP login. Run the helper again after promotion to see `admin`.
+The helper keeps its token in memory and calls `/me` itself: it deliberately
+does not print the token because repository rules forbid printing secrets.
+Offline tests cover invalid tokens, domain lookalikes, student/rep upload
+rejection, administrator upload attribution, and cache expiry.
+
+Live OTP delivery, trigger execution, and RLS must be checked in your own
+Supabase project; the offline suite mocks external services.

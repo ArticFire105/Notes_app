@@ -4,10 +4,10 @@ The upload response is sent before embedding runs.
 The background worker records safe failure messages.
 Existing CLI-created documents can lack a Storage path.
 
-This module belongs to Phase 3 of the notes application.
+This module combines Phase 3 uploads with Phase 4 permissions.
 The API wraps the existing ingestion and answering code.
-It runs locally until authentication is added in Phase 4.
-Do not deploy before Phase 4.
+Every document route requires a college login.
+Only administrators can upload official notes.
 
 Database credentials stay on the backend.
 The Storage service role key stays on the backend.
@@ -29,7 +29,7 @@ Question answers reuse the Phase 2 answer function.
 Tests replace model loading and all external calls.
 Tests never need real credentials or a real dotenv file.
 
-No authentication, quota, cache, or frontend is added here.
+Upload records use the verified administrator's profile ID.
 Run the API from the repository root.
 Use uv run pytest for the offline test suite.
 """
@@ -37,12 +37,13 @@ Use uv run pytest for the offline test suite.
 from io import BytesIO
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from psycopg.rows import dict_row
 from pypdf import PdfReader
 
 from app.db import get_conn
+from app.auth import require_role
 from app.ingest.pipeline import ingest_pdf
 from app.schemas import DocumentOut
 from app.storage import delete_pdf, signed_url, upload_pdf
@@ -113,6 +114,7 @@ async def create_document(
     subject_id: int = Form(gt=0),
     module_id: int = Form(gt=0),
     title: str = Form(min_length=1, max_length=500),
+    user=Depends(require_role("admin")),
 ):
     title = title.strip()
     if not title:
@@ -129,11 +131,11 @@ async def create_document(
             or not file_bytes.startswith(b"%PDF-")):
         raise HTTPException(400, "Upload a PDF file.")
     return await run_in_threadpool(
-        queue_document, background_tasks, file_bytes, subject_id, module_id, title
+        queue_document, background_tasks, file_bytes, subject_id, module_id, title, user["id"]
     )
 
 
-def queue_document(background_tasks, file_bytes, subject_id, module_id, title):
+def queue_document(background_tasks, file_bytes, subject_id, module_id, title, uploaded_by):
     try:
         reader = PdfReader(BytesIO(file_bytes))
         if reader.is_encrypted or len(reader.pages) == 0:
@@ -162,11 +164,11 @@ def queue_document(background_tasks, file_bytes, subject_id, module_id, title):
                 cursor.execute(
                     """
                     insert into documents
-                        (id, subject_id, module_id, source_type, title, storage_path, status)
-                    values (%s, %s, %s, 'official', %s, %s, 'processing')
+                        (id, subject_id, module_id, source_type, title, storage_path, status, uploaded_by)
+                    values (%s, %s, %s, 'official', %s, %s, 'processing', %s)
                     returning id, title, page_count, status, created_at, error
                     """,
-                    (document_id, subject_id, module_id, title, path),
+                    (document_id, subject_id, module_id, title, path, uploaded_by),
                 )
                 document = cursor.fetchone()
     except Exception:

@@ -47,6 +47,7 @@ from pypdf import PdfWriter
 import pytest
 
 from app import config, db, embeddings, llm, main, storage
+from app.auth import get_current_user
 from app.routers import ask, documents, subjects
 
 DOCUMENT_ID = UUID("00000000-0000-0000-0000-000000000001")
@@ -103,8 +104,14 @@ def backend(monkeypatch):
 
 @pytest.fixture
 def client(backend):
-    with TestClient(main.app) as client:
-        yield client
+    main.app.dependency_overrides[get_current_user] = lambda: {
+        "id": DOCUMENT_ID, "email": "admin@dxb.manipal.edu", "role": "admin",
+    }
+    try:
+        with TestClient(main.app) as client:
+            yield client
+    finally:
+        main.app.dependency_overrides.clear()
 
 
 @pytest.fixture
@@ -207,6 +214,10 @@ def test_upload_returns_processing_and_schedules_ingest(client, backend, record,
     backend.upload.assert_called_once_with(
         pdf, f"official/OS/module-2/{DOCUMENT_ID}.pdf"
     )
+    insert = next(call for call in backend.cursor.execute.call_args_list
+                  if "insert into documents" in call.args[0])
+    assert "uploaded_by" in insert.args[0]
+    assert insert.args[1][-1] == DOCUMENT_ID
     backend.ingest.assert_called_once_with(
         pdf, "OS", 2, "Memory", document_id=DOCUMENT_ID
     )
@@ -215,7 +226,7 @@ def test_upload_returns_processing_and_schedules_ingest(client, backend, record,
 def test_ingest_is_queued_not_run_by_upload_handler(backend, record, pdf):
     backend.cursor.fetchone.side_effect = [{"code": "OS"}, {"number": 2}, record]
     tasks = BackgroundTasks()
-    documents.queue_document(tasks, pdf, 1, 12, "Memory")
+    documents.queue_document(tasks, pdf, 1, 12, "Memory", DOCUMENT_ID)
     backend.ingest.assert_not_called()
     assert len(tasks.tasks) == 1
 
