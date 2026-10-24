@@ -4,8 +4,8 @@ Retrieval runs before any Gemini model is created.
 An empty result returns immediately to avoid spending credits.
 The response keeps sources and token counts beside the answer.
 
-This file belongs only to Phase 2 of the notes application.
-The phase runs through scripts before an API is introduced.
+This file serves both the CLI and authenticated API.
+Phase 5 adds context limits and a request-only BYOK override.
 Students can scope retrieval to a subject or a module.
 Document IDs can further narrow the retrieval function.
 Only official notes are eligible for these searches.
@@ -21,8 +21,8 @@ An unsupported question must produce the not-found response.
 Empty retrieval must not trigger a paid chat request.
 Chat output is limited through the existing settings class.
 Usage counts are returned for later accounting work.
-No quota or cache behavior is introduced in this phase.
-No authentication or frontend behavior is introduced here.
+The API router handles quota and cache before calling this function.
+The same context limit applies to server-key and BYOK requests.
 Real credentials belong only in the user's local configuration.
 Secrets must never appear in printed exception diagnostics.
 Offline tests replace settings and external service calls.
@@ -34,13 +34,32 @@ Real evaluation questions stay outside version control.
 Run the scripts from the repository root with uv.
 """
 
-from app.llm import get_chat_model, quiet_chat_output
+from app.config import Settings
+from app.llm import get_chat_model, provider_errors
 from app.rag.prompt import NOT_FOUND, SYSTEM_PROMPT, build_context
 from app.rag.retrieve import retrieve
 
 
-def answer_question(question, subject_id, module_id=None, document_id=None) -> dict:
+def trim_context(hits, max_tokens):
+    # Characters / 4 is an estimate, not the provider's exact tokenizer.
+    max_chars = max_tokens * 4
+    selected = []
+    for hit in hits:
+        candidate = [*selected, {**hit, "content": ""}]
+        available = max_chars - len(build_context(candidate))
+        if available <= 0:
+            break
+        candidate[-1]["content"] = hit["content"][:available]
+        selected = candidate
+        if len(hit["content"]) > available:
+            break
+    return selected, build_context(selected)
+
+
+def answer_question(question, subject_id, module_id=None, document_id=None, *, api_key=None) -> dict:
     hits = retrieve(question, subject_id, module_id, document_id)
+    if hits:
+        hits, context = trim_context(hits, Settings().max_context_tokens)
     if not hits:
         return {
             "answer": NOT_FOUND, "sources": [],
@@ -48,10 +67,11 @@ def answer_question(question, subject_id, module_id=None, document_id=None) -> d
         }
     messages = [
         ("system", SYSTEM_PROMPT),
-        ("human", f"Notes context:\n{build_context(hits)}\n\nQuestion:\n{question}"),
+        ("human", f"Notes context:\n{context}\n\nQuestion:\n{question}"),
     ]
-    with quiet_chat_output():
-        response = get_chat_model().invoke(messages)
+    with provider_errors():
+        model = get_chat_model() if api_key is None else get_chat_model(api_key)
+        response = model.invoke(messages)
     # Some LangChain responses expose text blocks instead of a plain string.
     content = response.content
     if isinstance(content, list):

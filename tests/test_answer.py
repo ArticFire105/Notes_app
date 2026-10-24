@@ -48,6 +48,11 @@ from app.rag.prompt import NOT_FOUND
 from scripts import ask, eval_retrieval
 
 
+@pytest.fixture(autouse=True)
+def offline_context_settings(monkeypatch):
+    monkeypatch.setattr(answer, "Settings", lambda: SimpleNamespace(max_context_tokens=4000))
+
+
 @pytest.fixture
 def hit():
     return {"subject": "OS", "module": 2, "module_title": "Memory",
@@ -132,6 +137,21 @@ def test_output_limit_default_and_environment_override(monkeypatch):
     assert Settings(_env_file=None, **values).max_output_tokens == 800
     monkeypatch.setenv("MAX_OUTPUT_TOKENS", "400")
     assert Settings(_env_file=None, **values).max_output_tokens == 400
+
+
+def test_phase_five_settings_without_dotenv(monkeypatch):
+    values = {
+        "database_url": "dummy-db", "supabase_url": "https://example.invalid",
+        "supabase_anon_key": "dummy", "supabase_service_role_key": "dummy",
+        "google_api_key": "dummy", "hf_token": "dummy",
+    }
+    monkeypatch.setenv("GLOBAL_DAILY_BUDGET_USD", "")
+    assert Settings(_env_file=None, **values).global_daily_budget_usd is None
+    monkeypatch.setenv("GLOBAL_DAILY_BUDGET_USD", "1.25")
+    assert str(Settings(_env_file=None, **values).global_daily_budget_usd) == "1.25"
+    monkeypatch.setenv("QUESTIONS_PER_DAY", "0")
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, **values)
 
 
 def test_ask_cli_prints_answer_sources_usage(monkeypatch, capsys):

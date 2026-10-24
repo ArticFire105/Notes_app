@@ -29,7 +29,7 @@ Question answers reuse the Phase 2 answer function.
 Tests replace model loading and all external calls.
 Tests never need real credentials or a real dotenv file.
 
-No authentication, quota, cache, or frontend is added here.
+Ask responses include the Phase 5 remaining daily allowance.
 Run the API from the repository root.
 Use uv run pytest for the offline test suite.
 """
@@ -90,4 +90,5 @@ class AskResponse(BaseModel):
     answer: str
     sources: list[Source]
     usage: Usage
+    remaining: int
 

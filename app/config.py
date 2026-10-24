@@ -34,9 +34,10 @@ Offline tests disable dotenv loading and supply dummy settings.
 Live setup checks are run manually after the SQL files are applied.
 """
 
+from decimal import Decimal
 from typing import Literal
 
-from pydantic import SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -60,8 +61,19 @@ class Settings(BaseSettings):
     embedding_model: str = "google/embeddinggemma-2"
     embedding_dim: int = 768
     chat_model: str = "google_genai:gemini-3.5-flash-lite"
-    max_output_tokens: int = 800
+    max_output_tokens: int = Field(default=800, gt=0)
     allowed_email_domain: str = "dxb.manipal.edu"
+    questions_per_day: int = Field(default=5, gt=0)
+    max_context_tokens: int = Field(default=4000, gt=0)
+    global_daily_cap: int = Field(default=100, gt=0)
+    global_daily_budget_usd: Decimal | None = Field(default=None, gt=0)
+    price_input_per_1m_usd: Decimal = Field(default=Decimal("0"), ge=0)
+    price_output_per_1m_usd: Decimal = Field(default=Decimal("0"), ge=0)
+
+    @field_validator("global_daily_budget_usd", mode="before")
+    @classmethod
+    def empty_budget_is_disabled(cls, value):
+        return None if value == "" else value
 
     @field_validator("embedding_dim")
     @classmethod

@@ -77,6 +77,13 @@ def record():
 
 @pytest.fixture
 def backend(monkeypatch):
+    monkeypatch.setattr(ask.cache, "scope_version", lambda subject_id: "documents-v1")
+    monkeypatch.setattr(ask.cache, "get", lambda key: None)
+    monkeypatch.setattr(ask.cache, "put", MagicMock())
+    monkeypatch.setattr(ask.quota, "dubai_day", lambda: "2026-10-24")
+    monkeypatch.setattr(ask.quota, "try_consume", lambda *args: True)
+    monkeypatch.setattr(ask.quota, "remaining", lambda user_id: 4)
+    monkeypatch.setattr(ask.quota, "record_usage", MagicMock())
     context = MagicMock()
     cursor = context.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
     for router in (ask, documents, subjects):
@@ -134,6 +141,34 @@ def test_health_and_startup_once(client, backend):
     assert client.get("/health").json() == {"status": "ok"}
     assert client.get("/health").status_code == 200
     backend.startup.assert_called_once()
+
+
+@pytest.mark.parametrize("environment", [None, "production", "staging", "invalid"])
+def test_docs_disabled_outside_development(monkeypatch, backend, environment):
+    if environment is None:
+        monkeypatch.delenv("APP_ENV", raising=False)
+    else:
+        monkeypatch.setenv("APP_ENV", environment)
+    with TestClient(main.create_app()) as local_client:
+        for path in ("/docs", "/openapi.json", "/redoc", "/docs/oauth2-redirect"):
+            assert local_client.get(path).status_code == 404
+        assert local_client.get("/health").status_code == 200
+
+
+def test_development_docs_have_authorize_and_keep_routes_protected(monkeypatch, backend):
+    monkeypatch.setenv("APP_ENV", "development")
+    with TestClient(main.create_app()) as local_client:
+        response = local_client.get("/docs")
+        assert response.status_code == 200
+        assert "/openapi.json" in response.text
+        assert '"persistAuthorization": false' in response.text
+        schema = local_client.get("/openapi.json").json()
+        assert schema["components"]["securitySchemes"]["HTTPBearer"] == {
+            "type": "http", "scheme": "bearer",
+        }
+        assert schema["paths"]["/me"]["get"]["security"] == [{"HTTPBearer": []}]
+        assert local_client.get("/me").status_code == 401
+        assert local_client.get("/redoc").status_code == 404
 
 
 @pytest.mark.parametrize("question", ["", " ", "x" * 1001])

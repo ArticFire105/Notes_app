@@ -10,6 +10,7 @@ from uuid import UUID
 from pgvector import Vector
 
 from app.config import Settings
+from app.cache import invalidate_scope
 from app.db import get_conn
 from app.embeddings import embed_documents
 from app.ingest.chunker import chunk_pages
@@ -131,6 +132,7 @@ def ingest_pdf(
                 "update documents set status = 'ready', error = null, page_count = %s where id = %s",
                 (page_count, document_id),
             )
+            invalidate_scope(subject_id, cursor)
 
     # Report success only after the connection context has committed all rows.
     print(

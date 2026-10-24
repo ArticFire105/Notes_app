@@ -174,8 +174,9 @@ def test_existing_document_ingestion_reuses_row_and_marks_ready(ingestion):
     assert not any("insert into documents" in call.args[0] for call in calls)
     assert calls[1].args[1] == (result, 1, 2, "official")
     assert "status = 'processing'" in calls[1].args[0]
-    assert "status = 'ready'" in calls[-1].args[0]
-    assert calls[-1].args[1] == (2, result)
+    assert "status = 'ready'" in calls[-2].args[0]
+    assert calls[-1].args == ("delete from answer_cache where subject_id = %s", (1,))
+    assert calls[-2].args[1] == (2, result)
     assert ingestion.cursor.executemany.call_args.args[1][0][0] == result
     ingestion.context.return_value.__exit__.assert_called_once_with(None, None, None)
 

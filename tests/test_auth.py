@@ -149,7 +149,8 @@ def test_upload_rejects_non_admin_before_work(backend, role):
     assert response.status_code == 403
 
 
-def test_otp_helper_keeps_token_private(backend, monkeypatch, capsys):
+@pytest.mark.parametrize("print_token", [False, True])
+def test_otp_helper_token_output_is_opt_in(backend, monkeypatch, capsys, print_token):
     monkeypatch.setattr(get_token, "Settings", lambda: backend.settings)
     monkeypatch.setattr("builtins.input", lambda _: "student@dxb.manipal.edu")
     monkeypatch.setattr(get_token, "getpass", lambda _: "123456")
@@ -159,8 +160,27 @@ def test_otp_helper_keeps_token_private(backend, monkeypatch, capsys):
     response = MagicMock()
     response.return_value.__enter__.return_value.read.return_value = b'{"email":"student@dxb.manipal.edu","role":"student"}'
     monkeypatch.setattr(get_token, "urlopen", response)
-    assert get_token.main() == 0
-    assert "fake-private-token" not in capsys.readouterr().out
+    assert get_token.main(["--print-token"] if print_token else []) == 0
+    output = capsys.readouterr().out
+    if print_token:
+        assert output == "fake-private-token\n"
+        response.assert_not_called()
+    else:
+        assert "fake-private-token" not in output
+        response.assert_called_once()
     provider.return_value.auth.verify_otp.assert_called_once_with({
         "email": "student@dxb.manipal.edu", "token": "123456", "type": "email",
     })
+
+
+def test_otp_helper_failed_login_does_not_print_token(backend, monkeypatch, capsys):
+    monkeypatch.setattr(get_token, "Settings", lambda: backend.settings)
+    monkeypatch.setattr("builtins.input", lambda _: "student@dxb.manipal.edu")
+    monkeypatch.setattr(get_token, "getpass", lambda _: "123456")
+    provider = MagicMock()
+    provider.return_value.auth.verify_otp.side_effect = RuntimeError("fake-private-token")
+    monkeypatch.setattr(get_token, "create_client", provider)
+    assert get_token.main(["--print-token"]) == 1
+    output = capsys.readouterr().out
+    assert "Login check failed" in output
+    assert "fake-private-token" not in output

@@ -38,7 +38,9 @@ No additional database query is needed in this handler.
 
 from fastapi import APIRouter, Depends
 
-from app.auth import get_current_user
+from app.auth import get_current_user, require_role
+from app import quota
+from app.llm import test_user_key, user_api_key
 
 router = APIRouter()
 
@@ -46,3 +48,18 @@ router = APIRouter()
 @router.get("/me")
 def me(user=Depends(get_current_user)):
     return {"email": user["email"], "role": user["role"]}
+
+
+@router.get("/me/usage")
+def my_usage(user=Depends(get_current_user)):
+    return quota.user_usage(user["id"])
+
+
+@router.get("/admin/usage/today")
+def today_usage(user=Depends(require_role("admin"))):
+    return quota.admin_usage()
+
+
+@router.post("/me/test-key")
+def check_key(user=Depends(get_current_user), api_key=Depends(user_api_key)):
+    return test_user_key(api_key)

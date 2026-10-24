@@ -10,16 +10,16 @@ The OTP is entered without terminal echo.
 No login credentials are accepted as arguments.
 
 Supabase creates a session after verification.
-The access token stays only in process memory.
+The access token stays in memory unless output is explicitly requested.
 Never paste tokens anywhere public.
-The repository rules forbid printing tokens.
+The --print-token flag explicitly opts into terminal output.
 
-The phase prompt originally requested token output.
-This helper instead makes an authenticated request.
-It calls the local backend's me endpoint.
-Only email and role are displayed.
+Without the flag, this helper makes an authenticated request.
+It calls the local backend's me endpoint by default.
+Only email and role are displayed by default.
+With the flag, it prints the token after login and exits.
 
-Start the FastAPI server before using this helper.
+Start FastAPI before using the default identity check.
 The backend verifies the returned access token.
 The backend reads the user's current profile.
 The migration must have been applied first.
@@ -33,9 +33,10 @@ Network failures produce fixed error messages.
 Raw provider exceptions are never printed.
 Tests replace input and external services.
 No frontend or quota behavior is implemented here.
-The process exits after checking the local identity endpoint.
+Token output does not require a running local backend.
 """
 
+import argparse
 from getpass import getpass
 import json
 from pathlib import Path
@@ -50,7 +51,13 @@ from app.auth import is_allowed_email
 from app.config import Settings
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Log in with email OTP for local API testing.")
+    parser.add_argument(
+        "--print-token", action="store_true",
+        help="Print the access token after login instead of checking /me.",
+    )
+    args = parser.parse_args(argv)
     try:
         settings = Settings()
         email = input("College email: ").strip().lower()
@@ -64,8 +71,12 @@ def main():
         client.auth.sign_in_with_otp({"email": email})
         code = getpass("Email OTP code (hidden): ").strip()
         session = client.auth.verify_otp({"email": email, "token": code, "type": "email"}).session
-        if session is None:
+        if session is None or not session.access_token:
             raise ValueError("Missing session")
+        if args.print_token:
+            # Explicit opt-in supports manual API testing; never paste tokens publicly.
+            print(session.access_token)
+            return 0
         request = Request("http://127.0.0.1:8000/me",
                           headers={"Authorization": "Bearer " + session.access_token})
         with urlopen(request, timeout=15) as response:
