@@ -84,11 +84,11 @@ def test_answer_keeps_scope_citations_and_tokens(monkeypatch, hit, content):
     search.assert_called_once_with("paging", 1, 12, "document-id")
     assert result["answer"] == "Pages [1]"
     assert result["sources"] == [
-        {"n": 1, "document": "Memory.pdf", "module": 2, "page": 14, "score": 0.9}
+        {"n": 1, "document": "Memory.pdf", "module": 2, "page": 14, "page_label": "p.14", "score": 0.9}
     ]
     assert result["usage"] == {"input_tokens": 100, "output_tokens": 10}
     messages = model.return_value.invoke.call_args.args[0]
-    assert "ONLY" in messages[0][1]
+    assert "primary evidence" in messages[0][1]
     assert "[1] (OS · Module 2 · Memory.pdf · p.14)" in messages[1][1]
 
 
@@ -100,6 +100,18 @@ def test_not_found_response_and_missing_usage(monkeypatch, hit):
     result = answer.answer_question("RSA?", 1, 12)
     assert result["answer"] == NOT_FOUND
     assert result["usage"] == {"input_tokens": 0, "output_tokens": 0}
+
+
+def test_powerpoint_answer_returns_slide_source_label(monkeypatch, hit):
+    hit.update(file_type="pptx", page=7)
+    monkeypatch.setattr(answer, "retrieve", lambda *args: [hit])
+    model = MagicMock()
+    model.invoke.return_value = SimpleNamespace(content="See the slide [1].", usage_metadata=None)
+    monkeypatch.setattr(answer, "get_chat_model", lambda: model)
+    result = answer.answer_question("Explain the notes", 1, 12)
+    assert result["sources"][0]["page"] == 7
+    assert result["sources"][0]["page_label"] == "Slide 7"
+    assert "Slide 7" in model.invoke.call_args.args[0][1][1]
 
 
 @pytest.mark.parametrize("override,expected", [(None, "dummy-server"), ("dummy-user", "dummy-user")])

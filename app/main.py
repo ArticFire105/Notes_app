@@ -38,12 +38,13 @@ from contextlib import asynccontextmanager
 import os
 
 from fastapi import Depends, FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.embeddings import get_embedder
 from app.auth import get_current_user
 from app.logging_safety import install_header_redaction
-from app.routers import ask, documents, me, subjects
+from app.routers import ask, documents, login, me, subjects
 
 
 @asynccontextmanager
@@ -82,7 +83,15 @@ def create_app():
         swagger_ui_parameters={"persistAuthorization": False},
     )
     application.middleware("http")(safe_errors)
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=[origin.strip() for origin in os.getenv("FRONTEND_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",") if origin.strip()],
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "DELETE"],
+        allow_headers=["Authorization", "Content-Type", "X-User-Api-Key", "X-Browser-Session"],
+    )
     application.get("/health")(health)
+    application.include_router(login.router)
     application.include_router(subjects.router, dependencies=[Depends(get_current_user)])
     application.include_router(documents.router, dependencies=[Depends(get_current_user)])
     application.include_router(ask.router, dependencies=[Depends(get_current_user)])

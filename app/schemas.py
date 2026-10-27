@@ -64,6 +64,7 @@ class DocumentOut(BaseModel):
     status: Literal["processing", "ready", "failed"]
     created_at: datetime
     error: str | None = None
+    file_type: Literal["pdf", "pptx"] = "pdf"
 
 
 class AskRequest(BaseModel):
@@ -71,6 +72,7 @@ class AskRequest(BaseModel):
     subject_id: int = Field(gt=0)
     module_id: int | None = Field(default=None, gt=0)
     document_id: UUID | None = None
+    mode: Literal["normal", "strict"] = "normal"
 
 
 class Source(BaseModel):
@@ -79,6 +81,7 @@ class Source(BaseModel):
     module: int | None
     page: int
     score: float
+    page_label: str | None = None
 
 
 class Usage(BaseModel):

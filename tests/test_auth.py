@@ -90,7 +90,9 @@ def test_college_domain(email, allowed):
     ("GET", "/subjects"), ("GET", "/subjects/1/modules"),
     ("GET", "/modules/1/documents"), ("GET", "/documents/00000000-0000-0000-0000-000000000001"),
     ("GET", "/documents/00000000-0000-0000-0000-000000000001/pdf-url"),
+    ("GET", "/documents/00000000-0000-0000-0000-000000000001/file-url"),
     ("POST", "/documents"), ("POST", "/ask"), ("GET", "/me"),
+    ("DELETE", "/documents/00000000-0000-0000-0000-000000000001"),
 ])
 def test_routes_require_authentication(backend, method, path):
     with TestClient(main.app) as client:

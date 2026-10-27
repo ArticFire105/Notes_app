@@ -84,6 +84,8 @@ def retrieve(question, subject_id, module_id=None, document_id=None, k=5) -> lis
     # Only fixed SQL fragments are joined; all supplied values stay parameters.
     query = """
         select c.content, c.page, d.title as document,
+               case when lower(d.storage_path) like '%%.pptx' then 'pptx'
+                    else 'pdf' end as file_type,
                s.code as subject, m.number as module, m.title as module_title,
                1 - (c.embedding <=> %s) as score
         from chunks c

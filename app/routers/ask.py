@@ -77,7 +77,7 @@ def ask(request: AskRequest, user=Depends(get_current_user), api_key=Depends(use
     check_scope(request)
     version = cache.scope_version(request.subject_id)
     key = cache.make_key(
-        request.question, request.subject_id, request.module_id, request.document_id, version
+        request.question, request.subject_id, request.module_id, request.document_id, version, request.mode
     )
     result = cache.get(key)
     if result is not None:
@@ -91,12 +91,12 @@ def ask(request: AskRequest, user=Depends(get_current_user), api_key=Depends(use
             raise HTTPException(429, "You've used your daily questions. Add your own free Google AI Studio key in Settings to keep going.")
     if api_key is None:
         result = answer_question(
-            request.question, request.subject_id, request.module_id, request.document_id
+            request.question, request.subject_id, request.module_id, request.document_id, mode=request.mode
         )
     else:
         result = answer_question(
             request.question, request.subject_id, request.module_id, request.document_id,
-            api_key=api_key,
+            api_key=api_key, mode=request.mode,
         )
     if api_key is None:
         if not result["sources"]:

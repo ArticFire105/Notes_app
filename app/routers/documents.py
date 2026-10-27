@@ -1,5 +1,5 @@
 """
-Handle official PDF upload and document status polling.
+Handle official PDF/PPTX upload and document status polling.
 The upload response is sent before embedding runs.
 The background worker records safe failure messages.
 Existing CLI-created documents can lack a Storage path.
@@ -43,15 +43,22 @@ from psycopg.rows import dict_row
 from pypdf import PdfReader
 
 from app.db import get_conn
+from app.cache import invalidate_scope
 from app.auth import require_role
-from app.ingest.pipeline import ingest_pdf
+from app.ingest.pipeline import IngestError, ingest_document
+from app.ingest.pptx_loader import NO_READABLE_SLIDES, NoReadableSlidesError, load_pptx_pages
+from app.logging_safety import log_safe_exception
 from app.schemas import DocumentOut
-from app.storage import delete_pdf, signed_url, upload_pdf
+from app.storage import delete_document, download_document, restore_document, signed_url, upload_document
 
 router = APIRouter()
-MAX_PDF_BYTES = 25 * 1024 * 1024
+MAX_UPLOAD_BYTES = 40 * 1024 * 1024
+PPTX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+DELETE_FAILED = "Could not complete document deletion. Please retry or check backend logs."
+DELETE_RECOVERY_FAILED = "Delete failed and the file could not be restored. Contact the administrator and check backend logs."
 DOCUMENT_COLUMNS = """
-    d.id, d.title, m.number as module, d.page_count, d.status, d.created_at, d.error
+    d.id, d.title, m.number as module, d.page_count, d.status, d.created_at, d.error,
+    case when lower(d.storage_path) like '%%.pptx' then 'pptx' else 'pdf' end as file_type
 """
 
 
@@ -71,21 +78,26 @@ def get_document(document_id: UUID):
     return document
 
 
-def finish_upload(file_bytes, document_id, subject_code, module_number, title):
+def finish_upload(file_bytes, document_id, subject_code, module_number, title, file_type="pdf"):
     try:
-        ingest_pdf(file_bytes, subject_code, module_number, title, document_id=document_id)
-    except Exception:
-        # Store a fixed message: raw exceptions can contain keys or DB URLs.
+        ingest_document(file_bytes, subject_code, module_number, title,
+                        document_id=document_id, file_type=file_type)
+    except Exception as error:
+        if isinstance(error, IngestError):
+            reason = error.safe_reason
+        else:
+            reason = "Document ingestion failed. Check backend logs for details."
+            log_safe_exception(error, reason)
         try:
             with get_conn() as connection:
                 with connection.cursor() as cursor:
                     cursor.execute(
                         "update documents set status = 'failed', error = %s where id = %s",
-                        ("PDF ingestion failed; check PDF text, model access, and database setup.",
-                         document_id),
+                        (reason, document_id),
                     )
-        except Exception:
+        except Exception as status_error:
             # If the DB itself is unavailable, status cannot be persisted yet.
+            log_safe_exception(status_error, "Could not record ingestion failure status.")
             return
 
 
@@ -121,27 +133,45 @@ async def create_document(
         raise HTTPException(400, "Provide a nonempty document title.")
     # Read only enough to reject an oversized file before Storage or embedding.
     try:
-        file_bytes = await file.read(MAX_PDF_BYTES + 1)
+        file_bytes = await file.read(MAX_UPLOAD_BYTES + 1)
     finally:
         await file.close()
-    if len(file_bytes) >= MAX_PDF_BYTES:
-        raise HTTPException(400, "PDF must be under 25 MB.")
-    if (file.content_type != "application/pdf"
-            or not (file.filename or "").lower().endswith(".pdf")
-            or not file_bytes.startswith(b"%PDF-")):
-        raise HTTPException(400, "Upload a PDF file.")
+    if len(file_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "File must be 40 MB or smaller.")
+    filename = (file.filename or "").lower()
+    if filename.endswith(".ppt"):
+        raise HTTPException(400, "Old .ppt files are not supported. Save as .pptx and upload again.")
+    if filename.endswith(".pptx"):
+        if (file.content_type not in {PPTX_CONTENT_TYPE, "application/octet-stream", "application/zip"}
+                or not file_bytes.startswith(b"PK")):
+            raise HTTPException(400, "Upload a valid .pptx PowerPoint file.")
+        file_type = "pptx"
+    elif (filename.endswith(".pdf") and file.content_type == "application/pdf"
+          and file_bytes.startswith(b"%PDF-")):
+        file_type = "pdf"
+    else:
+        raise HTTPException(400, "Upload a PDF or .pptx PowerPoint file.")
     return await run_in_threadpool(
-        queue_document, background_tasks, file_bytes, subject_id, module_id, title, user["id"]
+        queue_document, background_tasks, file_bytes, subject_id, module_id, title, user["id"], file_type
     )
 
 
-def queue_document(background_tasks, file_bytes, subject_id, module_id, title, uploaded_by):
+def queue_document(background_tasks, file_bytes, subject_id, module_id, title, uploaded_by, file_type="pdf"):
     try:
-        reader = PdfReader(BytesIO(file_bytes))
-        if reader.is_encrypted or len(reader.pages) == 0:
-            raise ValueError("Unreadable PDF")
-    except Exception:
-        raise HTTPException(400, "Upload a readable, unencrypted PDF.") from None
+        if file_type == "pptx":
+            pages, skipped = load_pptx_pages(file_bytes)
+            if not pages and not skipped:
+                raise ValueError("Empty presentation")
+        else:
+            reader = PdfReader(BytesIO(file_bytes))
+            if reader.is_encrypted or len(reader.pages) == 0:
+                raise ValueError("Unreadable PDF")
+    except NoReadableSlidesError as error:
+        log_safe_exception(error, NO_READABLE_SLIDES)
+        raise HTTPException(400, NO_READABLE_SLIDES) from None
+    except Exception as error:
+        log_safe_exception(error, "Could not read uploaded document.")
+        raise HTTPException(400, "Upload a readable, unencrypted PDF or .pptx presentation with slides.") from None
     with get_conn() as connection:
         with connection.cursor(row_factory=dict_row) as cursor:
             cursor.execute("select code from subjects where id = %s", (subject_id,))
@@ -156,8 +186,8 @@ def queue_document(background_tasks, file_bytes, subject_id, module_id, title, u
             if module is None:
                 raise HTTPException(404, "Module not found in this subject.")
     document_id = uuid4()
-    path = f"official/{subject['code']}/module-{module['number']}/{document_id}.pdf"
-    upload_pdf(file_bytes, path)
+    path = f"official/{subject['code']}/module-{module['number']}/{document_id}.{file_type}"
+    upload_document(file_bytes, path)
     try:
         with get_conn() as connection:
             with connection.cursor(row_factory=dict_row) as cursor:
@@ -173,13 +203,14 @@ def queue_document(background_tasks, file_bytes, subject_id, module_id, title, u
                 document = cursor.fetchone()
     except Exception:
         try:
-            delete_pdf(path)
+            delete_document(path)
         except Exception:
             pass
         raise HTTPException(500, "Could not record the uploaded document.") from None
     document["module"] = module["number"]
+    document["file_type"] = file_type
     background_tasks.add_task(
-        finish_upload, file_bytes, document_id, subject["code"], module["number"], title
+        finish_upload, file_bytes, document_id, subject["code"], module["number"], title, file_type
     )
     return document
 
@@ -189,10 +220,58 @@ def document_status(document_id: UUID):
     return get_document(document_id)
 
 
+@router.delete("/documents/{document_id}")
+def remove_document(document_id: UUID, user=Depends(require_role("admin"))):
+    file_bytes = None
+    storage_path = None
+    storage_attempted = False
+    try:
+        with get_conn() as connection:
+            with connection.cursor(row_factory=dict_row) as cursor:
+                cursor.execute("select module_id from documents where id = %s", (document_id,))
+                scope = cursor.fetchone()
+                if scope is None:
+                    raise HTTPException(404, "Document not found.")
+                # Match ingestion's module -> document lock order to avoid deadlocks.
+                if scope["module_id"] is not None:
+                    cursor.execute("select id from modules where id = %s for update", (scope["module_id"],))
+                cursor.execute(
+                    "select subject_id, storage_path from documents where id = %s for update",
+                    (document_id,),
+                )
+                document = cursor.fetchone()
+                if document is None:
+                    raise HTTPException(404, "Document not found.")
+                storage_path = document["storage_path"]
+                # Keep an in-memory copy until commit so a handled failure can restore the file.
+                if storage_path:
+                    file_bytes = download_document(storage_path)
+                cursor.execute("delete from chunks where document_id = %s", (document_id,))
+                invalidate_scope(document["subject_id"], cursor)
+                cursor.execute("delete from documents where id = %s", (document_id,))
+                # All SQL operations must succeed before attempting the external removal.
+                if storage_path:
+                    storage_attempted = True
+                    delete_document(storage_path)
+        return {"deleted": True, "id": str(document_id)}
+    except HTTPException:
+        raise
+    except Exception as error:
+        log_safe_exception(error, "Document deletion failed.")
+        if storage_attempted and file_bytes is not None:
+            try:
+                restore_document(file_bytes, storage_path)
+            except Exception as restore_error:
+                log_safe_exception(restore_error, "Could not restore document file after failed deletion.")
+                raise HTTPException(503, DELETE_RECOVERY_FAILED) from None
+        raise HTTPException(503, DELETE_FAILED) from None
+
+
 @router.get("/documents/{document_id}/pdf-url")
+@router.get("/documents/{document_id}/file-url")
 def document_pdf_url(document_id: UUID):
     document = get_document(document_id)
     if not document["storage_path"]:
-        raise HTTPException(404, "This document has no stored PDF; upload it through the API.")
+        raise HTTPException(404, "This document has no stored file; upload it through the API.")
     return {"url": signed_url(document["storage_path"])}
 

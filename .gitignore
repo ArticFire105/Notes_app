@@ -18,3 +18,11 @@ models/
 model_cache/
 sentence_transformers/
 .tools/
+
+# The Next.js app is rebuilt from package-lock.json and source.
+web/node_modules/
+web/.next/
+web/out/
+web/*.tsbuildinfo
+web/.env*
+!web/.env.example

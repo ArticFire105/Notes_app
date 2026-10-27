@@ -36,7 +36,7 @@ Run the scripts from the repository root with uv.
 
 from app.config import Settings
 from app.llm import get_chat_model, provider_errors
-from app.rag.prompt import NOT_FOUND, SYSTEM_PROMPT, build_context
+from app.rag.prompt import NOT_FOUND, SYSTEM_PROMPT, STRICT_PROMPT, build_context, source_label
 from app.rag.retrieve import retrieve
 
 
@@ -56,7 +56,7 @@ def trim_context(hits, max_tokens):
     return selected, build_context(selected)
 
 
-def answer_question(question, subject_id, module_id=None, document_id=None, *, api_key=None) -> dict:
+def answer_question(question, subject_id, module_id=None, document_id=None, *, api_key=None, mode="normal") -> dict:
     hits = retrieve(question, subject_id, module_id, document_id)
     if hits:
         hits, context = trim_context(hits, Settings().max_context_tokens)
@@ -66,7 +66,7 @@ def answer_question(question, subject_id, module_id=None, document_id=None, *, a
             "usage": {"input_tokens": 0, "output_tokens": 0},
         }
     messages = [
-        ("system", SYSTEM_PROMPT),
+        ("system", STRICT_PROMPT if mode == "strict" else SYSTEM_PROMPT),
         ("human", f"Notes context:\n{context}\n\nQuestion:\n{question}"),
     ]
     with provider_errors():
@@ -85,7 +85,7 @@ def answer_question(question, subject_id, module_id=None, document_id=None, *, a
         "answer": content,
         "sources": [
             {"n": n, "document": hit["document"], "module": hit["module"],
-             "page": hit["page"], "score": hit["score"]}
+             "page": hit["page"], "page_label": source_label(hit), "score": hit["score"]}
             for n, hit in enumerate(hits, start=1)
         ],
         "usage": {

@@ -8,6 +8,8 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 license = "MIT"
 dependencies = [
+    "streamlit>=1.37",
+    "httpx",
     "fastapi",
     "uvicorn[standard]",
     "python-multipart",
@@ -16,6 +18,7 @@ dependencies = [
     "pgvector",
     "pydantic-settings",
     "pypdf",
+    "python-pptx",
     "langchain-text-splitters",
     "langchain-huggingface",
     "sentence-transformers",

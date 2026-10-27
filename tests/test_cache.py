@@ -134,3 +134,7 @@ def test_scope_version_uses_only_ready_official_documents(database):
     assert "source_type = 'official'" in cursor.execute.call_args.args[0]
     assert "status = 'ready'" in cursor.execute.call_args.args[0]
 
+
+
+def test_answer_modes_do_not_share_cache():
+    assert cache.make_key("paging", 1, mode="normal") != cache.make_key("paging", 1, mode="strict")

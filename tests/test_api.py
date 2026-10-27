@@ -35,7 +35,9 @@ Use uv run pytest for the offline test suite.
 """
 
 from datetime import datetime, timezone
+from contextlib import contextmanager
 from io import BytesIO
+import sqlite3
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from uuid import UUID
@@ -44,6 +46,7 @@ from fastapi import BackgroundTasks
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from pypdf import PdfWriter
+from pptx import Presentation
 import pytest
 
 from app import config, db, embeddings, llm, main, storage
@@ -100,9 +103,9 @@ def backend(monkeypatch):
     ingest = MagicMock()
     remove = MagicMock()
     sign = MagicMock(return_value="https://example.invalid/temporary")
-    monkeypatch.setattr(documents, "upload_pdf", upload)
-    monkeypatch.setattr(documents, "ingest_pdf", ingest)
-    monkeypatch.setattr(documents, "delete_pdf", remove)
+    monkeypatch.setattr(documents, "upload_document", upload)
+    monkeypatch.setattr(documents, "ingest_document", ingest)
+    monkeypatch.setattr(documents, "delete_document", remove)
     monkeypatch.setattr(documents, "signed_url", sign)
     monkeypatch.setattr(documents, "uuid4", lambda: DOCUMENT_ID)
     return SimpleNamespace(cursor=cursor, startup=startup, generate=generate,
@@ -187,7 +190,7 @@ def test_ask_uses_validated_scope(client, backend):
     })
     assert response.status_code == 200
     assert response.json()["answer"] == "Pages [1]"
-    backend.generate.assert_called_once_with("paging?", 1, 12, DOCUMENT_ID)
+    backend.generate.assert_called_once_with("paging?", 1, 12, DOCUMENT_ID, mode="normal")
 
 
 @pytest.mark.parametrize("rows,payload", [
@@ -254,7 +257,7 @@ def test_upload_returns_processing_and_schedules_ingest(client, backend, record,
     assert "uploaded_by" in insert.args[0]
     assert insert.args[1][-1] == DOCUMENT_ID
     backend.ingest.assert_called_once_with(
-        pdf, "OS", 2, "Memory", document_id=DOCUMENT_ID
+        pdf, "OS", 2, "Memory", document_id=DOCUMENT_ID, file_type="pdf"
     )
 
 
@@ -281,8 +284,8 @@ def test_bad_file_returns_400_without_upload(client, backend, filename, content_
 
 
 def test_size_limit_and_blank_title(client, backend, pdf, monkeypatch):
-    monkeypatch.setattr(documents, "MAX_PDF_BYTES", len(pdf))
-    assert post_pdf(client, pdf).status_code == 400
+    monkeypatch.setattr(documents, "MAX_UPLOAD_BYTES", len(pdf) - 1)
+    assert post_pdf(client, pdf).status_code == 413
     assert post_pdf(client, pdf, title=" ").status_code == 400
     backend.upload.assert_not_called()
 
@@ -346,4 +349,291 @@ def test_storage_helpers_use_private_bucket_and_backend_key(monkeypatch):
     )
     bucket.create_signed_url.assert_called_once_with("official/OS/module-2/test.pdf", 3600)
     bucket.remove.assert_called_once_with(["official/OS/module-2/test.pdf"])
+
+
+@pytest.mark.parametrize("extra,expected", [(-1, 202), (0, 202), (1, 413)])
+def test_upload_enforces_actual_40_mb_boundary(client, backend, record, monkeypatch, extra, expected):
+    limit = 40 * 1024 * 1024
+    assert documents.MAX_UPLOAD_BYTES == limit
+    queue = MagicMock(return_value=record)
+    monkeypatch.setattr(documents, "queue_document", queue)
+    # Bypass parsing to isolate the real byte boundary without embedding a 40 MB file.
+    response = client.post(
+        "/documents", files={"file": ("large.pdf", b"%PDF-" + b" " * (limit + extra - 5), "application/pdf")},
+        data={"subject_id": 1, "module_id": 12, "title": "Large lecture"},
+    )
+    assert response.status_code == expected
+    if expected == 202:
+        assert queue.call_count == 1
+    else:
+        assert "40 MB" in response.json()["detail"]
+        queue.assert_not_called()
+    backend.upload.assert_not_called()
+    backend.ingest.assert_not_called()
+
+
+def make_pptx_bytes(with_slide=True):
+    presentation = Presentation()
+    if with_slide:
+        slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+        slide.notes_slide.notes_text_frame.text = "Useful speaker notes from the lecture."
+    output = BytesIO()
+    presentation.save(output)
+    return output.getvalue()
+
+
+def test_pptx_upload_stores_original_format_and_uses_shared_ingest(client, backend, record):
+    content = make_pptx_bytes()
+    backend.cursor.fetchone.side_effect = [{"code": "OS"}, {"number": 2}, record]
+    response = client.post(
+        "/documents", files={"file": ("lecture.PPTX", content, documents.PPTX_CONTENT_TYPE)},
+        data={"subject_id": 1, "module_id": 12, "title": "Lecture"},
+    )
+    assert response.status_code == 202
+    assert response.json()["file_type"] == "pptx"
+    backend.upload.assert_called_once_with(content, f"official/OS/module-2/{DOCUMENT_ID}.pptx")
+    backend.ingest.assert_called_once_with(
+        content, "OS", 2, "Lecture", document_id=DOCUMENT_ID, file_type="pptx",
+    )
+
+
+@pytest.mark.parametrize("filename,content", [
+    ("lecture.ppt", b"old binary PowerPoint"),
+    ("lecture.pptx", b"PK not a PowerPoint archive"),
+    ("lecture.pptx", b"not a zip archive"),
+    ("lecture.pptx", make_pptx_bytes(with_slide=False)),
+], ids=["old-ppt", "corrupt-zip", "wrong-signature", "empty-presentation"])
+def test_invalid_powerpoint_is_rejected_before_storage(client, backend, filename, content):
+    response = client.post(
+        "/documents", files={"file": (filename, content, documents.PPTX_CONTENT_TYPE)},
+        data={"subject_id": 1, "module_id": 12, "title": "Lecture"},
+    )
+    assert response.status_code == 400
+    if filename.endswith(".ppt"):
+        assert "Save as .pptx" in response.json()["detail"]
+    backend.upload.assert_not_called()
+    backend.ingest.assert_not_called()
+
+
+def test_pptx_download_url_uses_original_file(client, backend, record):
+    path = "official/OS/lecture.pptx"
+    backend.cursor.fetchone.return_value = {**record, "file_type": "pptx", "storage_path": path}
+    assert client.get(f"/documents/{DOCUMENT_ID}/file-url").status_code == 200
+    backend.sign.assert_called_once_with(path)
+
+
+def test_storage_uses_powerpoint_mime_type(monkeypatch):
+    bucket = MagicMock()
+    monkeypatch.setattr(storage, "_bucket", lambda: bucket)
+    storage.upload_document(b"fake-pptx", "official/lecture.pptx")
+    bucket.upload.assert_called_once_with(
+        "official/lecture.pptx", b"fake-pptx", file_options={"content-type": documents.PPTX_CONTENT_TYPE},
+    )
+
+
+def test_empty_pptx_upload_returns_readable_error(client, backend):
+    response = client.post(
+        "/documents", files={"file": ("empty.pptx", make_pptx_bytes(with_slide=False), documents.PPTX_CONTENT_TYPE)},
+        data={"subject_id": 1, "module_id": 12, "title": "Empty lecture"},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "No readable text found in slides"
+    backend.upload.assert_not_called()
+    backend.ingest.assert_not_called()
+
+
+def test_background_failure_saves_safe_reason_visible_in_status(client, backend, record):
+    from app.ingest.pipeline import IngestError
+    reason = "No readable text found in slides"
+    backend.ingest.side_effect = IngestError(reason, safe_reason=reason)
+    documents.finish_upload(b"fake", DOCUMENT_ID, "OS", 2, "Lecture", "pptx")
+    assert backend.cursor.execute.call_args.args[1] == (reason, DOCUMENT_ID)
+    backend.cursor.fetchone.return_value = {**record, "status": "failed", "error": reason}
+    response = client.get(f"/documents/{DOCUMENT_ID}")
+    assert response.status_code == 200
+    assert response.json()["error"] == reason
+
+
+def test_background_failure_logs_chained_exception_without_secrets(backend, caplog):
+    def fail(*args, **kwargs):
+        try:
+            raise ValueError("postgresql://user:fake-password@private/db")
+        except ValueError as cause:
+            raise RuntimeError("https://private.invalid?token=fake-token") from cause
+    backend.ingest.side_effect = fail
+    documents.finish_upload(b"fake", DOCUMENT_ID, "OS", 2, "Lecture", "pptx")
+    assert "Caused by:" in caplog.text
+    assert "RuntimeError" in caplog.text and "ValueError" in caplog.text
+    for value in ("fake-password", "fake-token", "https://", "postgresql://"):
+        assert value not in caplog.text
+
+
+@pytest.fixture
+def deletion_data(backend, monkeypatch):
+    # Real local transactions verify row/chunk/cache rollback without accessing Supabase.
+    database = sqlite3.connect(":memory:", check_same_thread=False)
+    database.row_factory = sqlite3.Row
+    database.executescript("""
+        pragma foreign_keys = on;
+        create table modules (id integer primary key);
+        create table documents (id text primary key, subject_id integer, module_id integer, storage_path text);
+        create table chunks (id integer, document_id text references documents(id) on delete cascade, embedding text);
+        create table answer_cache (subject_id integer, answer text);
+        insert into modules values (12);
+    """)
+    path = f"official/OS/module-2/{DOCUMENT_ID}.pdf"
+    database.execute("insert into documents values (?, 1, 12, ?)", (str(DOCUMENT_ID), path))
+    database.execute("insert into documents values ('other-document', 2, 12, null)")
+    database.execute("insert into chunks values (1, ?, 'fake-vector')", (str(DOCUMENT_ID),))
+    database.execute("insert into chunks values (2, 'other-document', 'other-vector')")
+    database.execute("insert into answer_cache values (1, 'old answer')")
+    database.execute("insert into answer_cache values (2, 'another subject answer')")
+    database.commit()
+    current = [None]
+    failures = {"commit": False, "sql": False}
+
+    def execute(query, params=()):
+        if failures["sql"] and query.startswith("delete from documents"):
+            raise RuntimeError("fake-db-error https://private.invalid?token=fake-token")
+        params = tuple(str(value) if isinstance(value, UUID) else value for value in params)
+        current[0] = database.execute(query.replace("%s", "?").replace(" for update", ""), params)
+
+    backend.cursor.execute.side_effect = execute
+    backend.cursor.fetchone.side_effect = lambda: current[0].fetchone()
+    backend.cursor.__enter__.return_value = backend.cursor
+
+    @contextmanager
+    def transaction():
+        try:
+            yield SimpleNamespace(cursor=lambda **kwargs: backend.cursor)
+            if failures["commit"]:
+                raise RuntimeError("fake-commit-error")
+            database.commit()
+        except Exception:
+            database.rollback()
+            raise
+
+    files = {path: b"original-file"}
+    download = MagicMock(side_effect=lambda name: files[name])
+    restore = MagicMock(side_effect=lambda content, name: files.update({name: content}))
+    backend.remove.side_effect = lambda name: files.pop(name, None)
+    monkeypatch.setattr(documents, "get_conn", transaction)
+    monkeypatch.setattr(documents, "download_document", download)
+    monkeypatch.setattr(documents, "restore_document", restore)
+    yield SimpleNamespace(database=database, files=files, path=path, download=download,
+                          restore=restore, failures=failures)
+    database.close()
+
+
+def test_admin_delete_removes_file_document_chunks_and_subject_cache(client, backend, deletion_data):
+    response = client.delete(f"/documents/{DOCUMENT_ID}")
+    assert response.status_code == 200
+    assert response.json() == {"deleted": True, "id": str(DOCUMENT_ID)}
+    assert deletion_data.files == {}
+    backend.remove.assert_called_once_with(deletion_data.path)
+    assert deletion_data.database.execute("select id from documents").fetchall()[0][0] == "other-document"
+    assert [row["document_id"] for row in deletion_data.database.execute("select * from chunks")] == ["other-document"]
+    assert [row["subject_id"] for row in deletion_data.database.execute("select * from answer_cache")] == [2]
+    deletion_data.restore.assert_not_called()
+
+
+@pytest.mark.parametrize("role", ["student", "rep"])
+def test_non_admin_delete_returns_403_without_mutation(client, backend, deletion_data, role):
+    main.app.dependency_overrides[get_current_user] = lambda: {
+        "id": DOCUMENT_ID, "email": "student@dxb.manipal.edu", "role": role,
+    }
+    assert client.delete(f"/documents/{DOCUMENT_ID}").status_code == 403
+    backend.cursor.execute.assert_not_called()
+    backend.remove.assert_not_called()
+    deletion_data.download.assert_not_called()
+    assert deletion_data.files[deletion_data.path] == b"original-file"
+
+
+def test_delete_missing_id_returns_404(client, backend, deletion_data):
+    response = client.delete("/documents/00000000-0000-0000-0000-000000000099")
+    assert response.status_code == 404
+    backend.remove.assert_not_called()
+    deletion_data.download.assert_not_called()
+
+
+def assert_delete_was_rolled_back(data):
+    assert data.database.execute("select count(*) from documents").fetchone()[0] == 2
+    assert data.database.execute("select count(*) from chunks").fetchone()[0] == 2
+    assert data.database.execute("select count(*) from answer_cache").fetchone()[0] == 2
+    assert data.files[data.path] == b"original-file"
+
+
+def test_database_delete_failure_keeps_file_and_rolls_back_all_rows(client, backend, deletion_data, caplog):
+    deletion_data.failures["sql"] = True
+    response = client.delete(f"/documents/{DOCUMENT_ID}")
+    assert response.status_code == 503
+    assert response.json()["detail"] == documents.DELETE_FAILED
+    assert_delete_was_rolled_back(deletion_data)
+    backend.remove.assert_not_called()
+    assert "Document deletion failed" in caplog.text
+    assert "fake-token" not in caplog.text + response.text
+    assert "https://" not in caplog.text + response.text
+
+
+def test_storage_timeout_after_removal_restores_file_and_rolls_back_sql(client, backend, deletion_data):
+    def uncertain_remove(path):
+        deletion_data.files.pop(path)
+        raise RuntimeError("fake-storage-timeout")
+    backend.remove.side_effect = uncertain_remove
+    response = client.delete(f"/documents/{DOCUMENT_ID}")
+    assert response.status_code == 503
+    assert_delete_was_rolled_back(deletion_data)
+    deletion_data.restore.assert_called_once_with(b"original-file", deletion_data.path)
+
+
+def test_commit_failure_restores_file_and_rolls_back_sql(client, deletion_data):
+    deletion_data.failures["commit"] = True
+    assert client.delete(f"/documents/{DOCUMENT_ID}").status_code == 503
+    assert_delete_was_rolled_back(deletion_data)
+
+
+def test_backup_failure_prevents_any_deletion(client, backend, deletion_data):
+    deletion_data.download.side_effect = RuntimeError("fake-download-failure")
+    assert client.delete(f"/documents/{DOCUMENT_ID}").status_code == 503
+    assert_delete_was_rolled_back(deletion_data)
+    backend.remove.assert_not_called()
+
+
+def test_restore_failure_is_logged_and_returns_explicit_recovery_error(client, backend, deletion_data, caplog):
+    backend.remove.side_effect = RuntimeError("fake-remove-error")
+    deletion_data.restore.side_effect = RuntimeError("fake-restore-error")
+    response = client.delete(f"/documents/{DOCUMENT_ID}")
+    assert response.status_code == 503
+    assert response.json()["detail"] == documents.DELETE_RECOVERY_FAILED
+    assert "Could not restore document file" in caplog.text
+    assert_delete_was_rolled_back(deletion_data)
+
+
+def test_delete_document_without_storage_path_still_removes_rows(client, backend, deletion_data):
+    deletion_data.database.execute("update documents set storage_path = null where id = ?", (str(DOCUMENT_ID),))
+    deletion_data.database.commit()
+    assert client.delete(f"/documents/{DOCUMENT_ID}").status_code == 200
+    deletion_data.download.assert_not_called()
+    backend.remove.assert_not_called()
+    assert deletion_data.database.execute("select count(*) from chunks").fetchone()[0] == 1
+
+
+def test_browser_cors_allows_delete(client):
+    response = client.options(f"/documents/{DOCUMENT_ID}", headers={
+        "Origin": "http://localhost:3000", "Access-Control-Request-Method": "DELETE",
+        "Access-Control-Request-Headers": "authorization",
+    })
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
+
+
+def test_storage_backup_and_restore_helpers_use_private_bucket(monkeypatch):
+    bucket = MagicMock()
+    bucket.download.return_value = b"original-file"
+    monkeypatch.setattr(storage, "_bucket", lambda: bucket)
+    assert storage.download_document("official/lecture.pptx") == b"original-file"
+    storage.restore_document(b"original-file", "official/lecture.pptx")
+    bucket.upload.assert_called_once_with("official/lecture.pptx", b"original-file", file_options={
+        "content-type": documents.PPTX_CONTENT_TYPE, "upsert": "true",
+    })
 

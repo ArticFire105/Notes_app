@@ -6,7 +6,16 @@ Phase 0 provides configuration and database setup; Phase 1 adds local PDF ingest
 
 Stack: Python 3.12 + uv; Supabase Postgres, pgvector, Auth, and Storage;
 local EmbeddingGemma embeddings; Gemini `gemini-3.5-flash-lite`.
-FastAPI and the Streamlit UI come in later phases.
+FastAPI serves the backend; Streamlit provides the Phase 6 UI.
+
+The current frontend is the Next.js App Router app in `web/`. The older
+Streamlit `frontend/` folder is retained. See [web/README.md](web/README.md)
+for Node installation, startup commands, and the manual UI checklist.
+
+Current uploads support PDF and PowerPoint (`.pptx`) up to 40 MB in FastAPI
+and the Next.js admin screen. PowerPoint slide text and speaker notes use the
+shared ingestion pipeline and retain **Slide N** citations. Save old `.ppt`
+files as `.pptx` before uploading. See the web README for Storage settings.
 
 ## How to run locally
 
@@ -295,3 +304,80 @@ chosen setting afterward. Also test a small positive dollar budget with known
 prices. Compare estimated spend with the Google Cloud Billing page later.
 Live RLS, timezone rollover, and database concurrency checks remain manual;
 offline tests check the SQL structure and request behavior with service doubles.
+
+## Streamlit UI (Phase 6)
+
+Install dependencies from the repository root:
+
+```powershell
+uv sync
+uv run pytest
+```
+
+Start FastAPI in terminal 1:
+
+```powershell
+uv run uvicorn app.main:app --reload
+```
+
+Start Streamlit in terminal 2:
+
+```powershell
+$env:API_BASE_URL = 'http://127.0.0.1:8000'
+uv run streamlit run frontend/app.py
+```
+
+Open http://localhost:8501. The frontend reads only `API_BASE_URL` from the
+process environment, with the local backend URL as its default. It does not
+load `.env`, import backend settings, connect to Postgres, or use a Supabase
+key. Do not give the frontend database or service role credentials.
+`.env.example` documents the new setting; set it in the frontend shell.
+
+The phase prompt proposed direct Supabase login. To honor the backend-only
+frontend boundary, FastAPI now proxies login with the existing anon key:
+`POST /auth/send-code`, `POST /auth/verify`, and `POST /auth/refresh`.
+These are the only new backend routes. Each Supabase client disables session
+persistence and automatic refresh. Token responses have `Cache-Control: no-store`.
+Streamlit refreshes expiring sessions through FastAPI and keeps rotated tokens
+only in `st.session_state`. No database migration is needed for Phase 6.
+
+Complete these steps by hand before live testing:
+
+1. Finish the Phase 4 and 5 Supabase migrations and backend configuration if
+   not already done. Keep real credentials in your backend configuration only.
+2. Enable email OTP in Supabase, configure SMTP for college users, and include
+   `{{ .Token }}` in the email template. Set OTP length to **6 digits** to match
+   this screen. Sending codes is subject to your project's email rate limits.
+3. For upload testing, promote your own profile to `admin` as described above.
+   The existing private `notes` Storage bucket must be configured. The backend
+   embedding model must already be accessible.
+4. Run the installation, tests, and two server commands above.
+
+Walk through the UI:
+
+- Reject a noncollege email. Log in with a college email and its emailed code.
+- Check the five seeded subject cards and module counts. Open OS, expand Module 2,
+  obtain a PDF link, then click **View PDF** to open the signed link in a new tab.
+  If older CLI-ingested documents have no stored PDF, upload one through the UI.
+- Ask a question with **This module** (the default), **This PDF**, and
+  **Whole subject**. Verify document names, module numbers, pages, and scores
+  in Sources. Switch subjects and confirm their chats stay separate.
+- Check that remaining questions update after successful calls. Repeated cached
+  answers should leave the allowance unchanged. At the daily limit, add your
+  own key in Settings to continue; shared/global limits may also return 429.
+- In Settings, follow the AI Studio link, paste a key into the password box,
+  and click **Test key**. This makes a small billable call using that key.
+  Navigate away and back: the key should still work. Remove it and verify it
+  is cleared. Refresh the tab or log out: both tokens and the key should clear.
+- As an admin, upload a text PDF under 25 MB and watch status refresh every
+  three seconds until ready or failed. A backend restart can interrupt the
+  existing in-process ingestion task; polling does not restart ingestion.
+- Log in as a student: Admin upload must be absent. Notes, Past papers, and
+  Quiz should show **Coming soon**.
+
+Tokens, keys, widget values, and per-subject chats are session-only and are
+cleared on logout. Refreshing the page starts a new Streamlit session.
+FastAPI remains responsible for domain validation, roles, quota, and retrieval.
+Offline tests mock HTTP and Supabase, exercise Streamlit screens, and make no
+live email, database, Storage, model-download, or Gemini calls. Live email
+delivery, signed PDF links, ingestion, and answer quality must be tested by hand.

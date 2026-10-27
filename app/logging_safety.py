@@ -35,6 +35,8 @@ Configuration defaults can be overridden by the user.
 """
 
 import logging
+from pathlib import Path
+import re
 import traceback
 
 
@@ -62,4 +64,31 @@ def install_header_redaction():
 
     make_record._notes_redaction = True
     logging.setLogRecordFactory(make_record)
+
+
+def log_safe_exception(error: Exception, message: str):
+    """Keep real exception types and stack locations without potentially secret text."""
+    lines = []
+    seen = set()
+    current = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        lines.append("Traceback (most recent call last):")
+        for frame, line_number in traceback.walk_tb(current.__traceback__):
+            # Omit source lines, locals, full paths, and exception messages: any can carry credentials.
+            filename = Path(frame.f_code.co_filename).name
+            lines.append(f'  File "{filename}", line {line_number}, in {frame.f_code.co_name}')
+        lines.append(f"{type(current).__name__}: [exception message omitted]")
+        current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
+        if current is not None and id(current) not in seen:
+            lines.append("Caused by:")
+    logging.getLogger("app.ingest").error("%s\n%s", message, "\n".join(lines))
+
+
+def safe_chunk_preview(text: str) -> str:
+    # Inspect before truncating so a credential label/value beyond character 80 still triggers masking.
+    if re.search(r"(?i)\b(key|token|password|secret|bearer|authorization)\b|(?:AIza|hf_|sk-)[A-Za-z0-9_-]+|\b[A-Za-z0-9_=-]{20,}\b", text):
+        return "[redacted: potentially sensitive text]"
+    text = re.sub(r"(?:https?://|file://|www\.)\S+|[A-Za-z]:[\\/]\S+", "[reference redacted]", text, flags=re.IGNORECASE)
+    return " ".join(text.split())[:80]
 
