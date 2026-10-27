@@ -182,7 +182,7 @@ test("follow-up sends recent text without source metadata", async () => {
   saveSession(session);
   globalThis.fetch = async (url, init) => {
     const body = JSON.parse(init.body);
-    assert.deepEqual(body.history, [{ role: "user", content: "What is paging?" }]);
+    assert.deepEqual(body.history, [{ role: "user", content: "What is paging?", sources: [] }]);
     return Response.json({ answer: "Answer", sources: [], remaining: 4 });
   };
   await api.ask("Explain it", 1, null, null, "strict", [{ role: "user", content: "What is paging?", sources: [] }]);
@@ -197,4 +197,26 @@ test("slide viewer requests the cited slide with authorization", async () => {
     return Response.json({ number: 5, total: 8, aspect: 1.7, shapes: [] });
   };
   assert.equal((await api.slide("doc-1", 5)).number, 5);
+});
+
+
+test("assistant sources travel with the follow-up", async () => {
+  saveSession(session);
+  const source = { n: 1, document_id: "00000000-0000-0000-0000-000000000001", document: "Notes", module: 1, page: 5, score: 0.9 };
+  globalThis.fetch = async (url, init) => {
+    assert.deepEqual(JSON.parse(init.body).history[0].sources, [source]);
+    return Response.json({ answer: "Simple", sources: [source], remaining: 3 });
+  };
+  await api.ask("Explain it more simply", 1, null, null, "normal", [{ role: "assistant", content: "Earlier answer [1]", sources: [source] }]);
+});
+
+
+test("PowerPoint preview returns a PDF blob", async () => {
+  saveSession(session);
+  globalThis.fetch = async (url, init) => {
+    assert.ok(url.endsWith("/documents/doc-1/preview"));
+    assert.equal(init.headers.get("Authorization"), "Bearer fake-access");
+    return new Response("%PDF-test", { headers: { "Content-Type": "application/pdf" } });
+  };
+  assert.equal(await (await api.preview("doc-1")).text(), "%PDF-test");
 });

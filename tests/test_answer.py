@@ -64,7 +64,7 @@ def test_empty_retrieval_skips_paid_model(monkeypatch):
     monkeypatch.setattr(answer, "retrieve", MagicMock(return_value=[]))
     model = MagicMock()
     monkeypatch.setattr(answer, "get_chat_model", model)
-    assert answer.answer_question("paging", 1, 12) == {
+    assert answer.answer_question("paging", 1, 12, mode="strict") == {
         "answer": NOT_FOUND, "sources": [],
         "usage": {"input_tokens": 0, "output_tokens": 0},
     }
@@ -240,3 +240,70 @@ def test_small_talk_uses_model_without_sources(monkeypatch):
     monkeypatch.setattr(answer, "get_chat_model", lambda: model)
     result = answer.answer_small_talk("Hi")
     assert result == {"answer": "Hello!", "sources": [], "usage": {"input_tokens": 4, "output_tokens": 2}}
+
+
+def test_normal_without_notes_answers_from_general_knowledge(monkeypatch):
+    monkeypatch.setattr(answer, "retrieve", lambda *args: [])
+    model = MagicMock()
+    model.invoke.return_value = SimpleNamespace(content="Beyond the notes: Paging divides memory into pages.", usage_metadata={"input_tokens": 4, "output_tokens": 8})
+    monkeypatch.setattr(answer, "get_chat_model", lambda: model)
+    result = answer.answer_question("What is paging?", 1, mode="normal")
+    assert result["answer"].startswith("Beyond the notes")
+    assert "Beyond the notes" in model.invoke.call_args.args[0][0][1]
+    assert result["sources"] == []
+
+
+@pytest.mark.parametrize("mode", ["normal", "strict"])
+def test_style_followup_reuses_previous_sources_without_vector_search(monkeypatch, hit, mode):
+    source = {"document_id": "00000000-0000-0000-0000-000000000001", "page": 14, "score": .9}
+    hit["document_id"] = source["document_id"]
+    monkeypatch.setattr(answer, "previous_source_hits", lambda *args: [hit])
+    search = MagicMock()
+    monkeypatch.setattr(answer, "retrieve", search)
+    model = MagicMock()
+    model.invoke.return_value = SimpleNamespace(content="A simple explanation [1].", usage_metadata={"input_tokens": 5, "output_tokens": 3})
+    monkeypatch.setattr(answer, "get_chat_model", lambda: model)
+    result = answer.answer_question("Explain it more simply", 1, mode=mode, history=[{"role": "assistant", "content": "Earlier answer", "sources": [source]}])
+    search.assert_not_called()
+    assert result["sources"][0]["page"] == 14
+    assert "short plain words" in model.invoke.call_args.args[0][0][1]
+
+
+def test_explicit_general_followup_does_not_search(monkeypatch):
+    search = MagicMock()
+    monkeypatch.setattr(answer, "retrieve", search)
+    model = MagicMock()
+    model.invoke.return_value = SimpleNamespace(content="Beyond the notes: Pages are like boxes.", usage_metadata={})
+    monkeypatch.setattr(answer, "get_chat_model", lambda: model)
+    result = answer.answer_question("explain in your own way, no need for notes", 1, history=[{"role": "assistant", "content": "Paging", "sources": []}])
+    assert result["sources"] == []
+    search.assert_not_called()
+    assert "Beyond the notes" in model.invoke.call_args.args[0][0][1]
+
+
+def test_only_cited_sources_are_returned(monkeypatch, hit):
+    hits = [hit, {**hit, "document": "Unrelated", "page": 20}]
+    monkeypatch.setattr(answer, "retrieve", lambda *args: hits)
+    model = MagicMock()
+    model.invoke.return_value = SimpleNamespace(content="Paging uses pages [1].", usage_metadata={})
+    monkeypatch.setattr(answer, "get_chat_model", lambda: model)
+    result = answer.answer_question("paging", 1)
+    assert len(result["sources"]) == 1
+    assert result["sources"][0]["document"] == "Memory.pdf"
+
+
+def test_chunks_from_same_page_share_one_citation(hit):
+    merged = answer.combine_pages([hit, {**hit, "content": "More detail."}])
+    assert len(merged) == 1
+    assert "Paging uses pages." in merged[0]["content"]
+    assert "More detail." in merged[0]["content"]
+
+
+def test_general_answer_is_labelled_even_if_model_omits_label(monkeypatch):
+    monkeypatch.setattr(answer, "retrieve", lambda *args: [])
+    model = MagicMock()
+    model.invoke.return_value = SimpleNamespace(content="Paging divides memory. [1]", usage_metadata={})
+    monkeypatch.setattr(answer, "get_chat_model", lambda: model)
+    result = answer.answer_question("What is paging?", 1)
+    assert result["answer"] == "Beyond the notes: Paging divides memory."
+    assert result["sources"] == []

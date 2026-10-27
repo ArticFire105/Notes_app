@@ -110,3 +110,31 @@ def retrieve(question, subject_id, module_id=None, document_id=None, k=5) -> lis
     # Relaxed iterative scans can return slightly unordered distances.
     return sorted(hits, key=lambda hit: hit["score"], reverse=True)
 
+
+
+def previous_source_hits(sources, subject_id, module_id=None, document_id=None):
+    """Load only cited official pages still inside the selected scope."""
+    hits = []
+    with get_conn() as connection:
+        with connection.cursor(row_factory=dict_row) as cursor:
+            for source in sources:
+                if not source.get("document_id"):
+                    continue
+                cursor.execute("""select c.content, c.page, d.id as document_id, d.title as document,
+                    case when lower(d.storage_path) like '%%.pptx' then 'pptx' else 'pdf' end as file_type,
+                    s.code as subject, m.number as module, m.title as module_title
+                    from chunks c join documents d on d.id = c.document_id
+                    join subjects s on s.id = c.subject_id left join modules m on m.id = c.module_id
+                    where c.document_id = %s and c.page = %s and c.subject_id = %s
+                    and c.source_type = 'official' and d.source_type = 'official' and d.status = 'ready'
+                    and (%s::int is null or c.module_id = %s)
+                    and (%s::uuid is null or c.document_id = %s)
+                    order by c.chunk_index limit 4""", (source["document_id"], source["page"], subject_id,
+                    module_id, module_id, document_id, document_id))
+                rows = cursor.fetchall()
+                if rows:
+                    hit = dict(rows[0])
+                    hit["content"] = "\n".join(row["content"] for row in rows)
+                    hit["score"] = source.get("score", 0)
+                    hits.append(hit)
+    return hits

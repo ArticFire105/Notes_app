@@ -692,3 +692,39 @@ def test_presentation_viewer_returns_requested_slide(client, monkeypatch):
     assert response.json()["shapes"][0]["text"] == "Paging"
     assert response.json()["total"] == 1
     assert client.get(f"/documents/{DOCUMENT_ID}/slides/2").status_code == 404
+
+
+def test_powerpoint_preview_returns_converted_pdf(client, monkeypatch):
+    monkeypatch.setattr(documents, "get_document", lambda document_id: {"storage_path": "notes/test.pptx"})
+    monkeypatch.setattr(documents, "download_document", lambda path: b"original-pptx")
+    convert = MagicMock(return_value=b"%PDF-fake")
+    monkeypatch.setattr(documents, "convert_presentation", convert)
+    response = client.get(f"/documents/{DOCUMENT_ID}/preview")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/pdf"
+    assert response.content == b"%PDF-fake"
+    convert.assert_called_once_with(b"original-pptx")
+
+
+def test_powerpoint_converter_requires_libreoffice(monkeypatch):
+    monkeypatch.setattr(documents.shutil, "which", lambda name: None)
+    monkeypatch.setattr(documents.Path, "is_file", lambda self: False)
+    with pytest.raises(documents.HTTPException) as error:
+        documents.convert_presentation(b"presentation")
+    assert error.value.status_code == 503
+
+
+def test_converter_uses_isolated_profile_and_cleans_temporary_files(monkeypatch):
+    monkeypatch.setattr(documents.shutil, "which", lambda name: "soffice")
+    seen = {}
+    def convert(command, **kwargs):
+        source = documents.Path(command[-1])
+        seen["folder"] = source.parent
+        assert source.read_bytes() == b"pptx-data"
+        assert "--headless" in command
+        assert any(part.startswith("-env:UserInstallation=") for part in command)
+        assert kwargs["timeout"] == 120
+        (source.parent / "presentation.pdf").write_bytes(b"%PDF-converted")
+    monkeypatch.setattr(documents.subprocess, "run", convert)
+    assert documents.convert_presentation(b"pptx-data") == b"%PDF-converted"
+    assert not seen["folder"].exists()

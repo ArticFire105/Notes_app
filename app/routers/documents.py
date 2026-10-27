@@ -36,9 +36,14 @@ Use uv run pytest for the offline test suite.
 
 from io import BytesIO
 from uuid import UUID, uuid4
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import Response
 from psycopg.rows import dict_row
 from pypdf import PdfReader
 
@@ -314,3 +319,46 @@ def document_slide(document_id: UUID, number: int):
         raise
     except Exception:
         raise HTTPException(503, "Could not display this slide.") from None
+
+
+def convert_presentation(file_bytes):
+    executable = shutil.which("soffice") or shutil.which("libreoffice")
+    if not executable:
+        for candidate in (Path("C:/Program Files/LibreOffice/program/soffice.exe"),
+                          Path("C:/Program Files (x86)/LibreOffice/program/soffice.exe")):
+            if candidate.is_file():
+                executable = str(candidate)
+                break
+    if not executable:
+        raise HTTPException(503, "Install LibreOffice on the backend to preview PowerPoint files.")
+    try:
+        # A separate profile avoids collisions with the desktop app and other previews.
+        with tempfile.TemporaryDirectory(prefix="notes-preview-") as folder:
+            root = Path(folder)
+            source = root / "presentation.pptx"
+            source.write_bytes(file_bytes)
+            profile = (root / "profile").as_uri()
+            subprocess.run([executable, "--headless", f"-env:UserInstallation={profile}",
+                            "--convert-to", "pdf", "--outdir", str(root), str(source)],
+                           check=True, timeout=120, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            result = (root / "presentation.pdf").read_bytes()
+            if not result.startswith(b"%PDF-"):
+                raise ValueError("Invalid conversion")
+            return result
+    except Exception:
+        raise HTTPException(503, "Could not convert this presentation for preview.") from None
+
+
+@router.get("/documents/{document_id}/preview")
+def presentation_preview(document_id: UUID):
+    document = get_document(document_id)
+    path = document.get("storage_path")
+    if not path or not path.lower().endswith(".pptx"):
+        raise HTTPException(404, "Presentation not found.")
+    try:
+        pdf = convert_presentation(download_document(path))
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(503, "Could not load this presentation for preview.") from None
+    return Response(pdf, media_type="application/pdf", headers={"Cache-Control": "no-store"})

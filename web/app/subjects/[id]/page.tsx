@@ -40,7 +40,7 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { ArrowLeft, ArrowUpRight, BookOpen, FileText, Send, Sparkles, Layers, ChevronDown } from "lucide-react";
-import { api, errorMessage, type Subject, type Module, type Document, type Usage, type Slide, type Source } from "@/lib/api";
+import { api, errorMessage, type Subject, type Module, type Document, type Usage, type Source } from "@/lib/api";
 import { useSession } from "@/components/session-provider";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -64,7 +64,8 @@ export default function SubjectPage() {
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [viewer, setViewer] = useState<{ document: Document; page: number; url?: string; slide?: Slide } | null>(null);
+  const [viewer, setViewer] = useState<{ document: Document; page: number; url: string; downloadUrl?: string } | null>(null);
+  const [zoom, setZoom] = useState(100);
   const [openingFile, setOpeningFile] = useState("");
   const bottom = useRef<HTMLDivElement>(null);
   const messages = histories[subjectId] || [];
@@ -94,6 +95,11 @@ export default function SubjectPage() {
   }, [subjectId]);
   useEffect(() => { bottom.current?.scrollIntoView({ behavior: "smooth", block: "nearest" }); }, [messages.length, busy]);
 
+  useEffect(() => {
+    const url = viewer?.url;
+    return () => { if (url?.startsWith("blob:")) URL.revokeObjectURL(url); };
+  }, [viewer?.url]);
+
   const selectedModule = modules.find(module => module.id === moduleId);
   const ready = (documents[moduleId || 0] || []).filter(document => document.status === "ready");
   const selectedDocumentId = ready.some(document => document.id === documentId) ? documentId : ready[0]?.id || "";
@@ -103,14 +109,18 @@ export default function SubjectPage() {
     setOpeningFile(document.id); setError("");
     try {
       if (document.file_type === "pptx") {
-        const slide = await api.slide(document.id, page);
-        setViewer({ document, page, slide });
+        const [pdf, original] = await Promise.all([api.preview(document.id), api.fileUrl(document.id)]);
+        const originalUrl = new URL(original.url);
+        if (!["https:", "http:"].includes(originalUrl.protocol)) throw new Error("Unsupported URL");
+        const url = URL.createObjectURL(pdf);
+        setViewer({ document, page, url, downloadUrl: original.url });
       } else {
         const { url } = await api.fileUrl(document.id);
         const parsed = new URL(url);
         if (!["https:", "http:"].includes(parsed.protocol)) throw new Error("Unsupported URL");
         setViewer({ document, page, url });
       }
+      setZoom(100);
     } catch (error) { setError(errorMessage(error)); }
     finally { setOpeningFile(""); }
   }
@@ -148,13 +158,13 @@ export default function SubjectPage() {
     <Link href="/" className="mb-6 inline-flex items-center gap-2 text-xs text-muted-foreground hover:text-primary"><ArrowLeft size={14} />All subjects</Link>
     <div className="mb-7 flex flex-wrap items-center gap-4"><span className="grid size-14 place-items-center rounded-xl bg-primary text-lg font-semibold text-white">{subject.code}</span><div><p className="mb-1 text-[10px] font-medium uppercase tracking-[.2em] text-gold">Your course workspace</p><h1 className="font-heading text-2xl font-semibold sm:text-3xl">{subject.name}</h1></div></div>
     {error && <p role="alert" className="mb-5 rounded-lg bg-red-50 p-4 text-sm text-red-800">{error}</p>}
-    {viewer && <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-3" role="dialog" aria-modal="true" aria-label={viewer.document.title}>
-      <div className="flex h-[90vh] w-full max-w-5xl flex-col rounded-xl bg-white p-4 shadow-xl">
-        <div className="mb-3 flex items-center justify-between gap-4"><h2 className="truncate font-semibold">{viewer.document.title}</h2><Button variant="outline" size="sm" onClick={() => setViewer(null)}>Close</Button></div>
-        {viewer.url && <iframe title={viewer.document.title} className="w-full flex-1" src={`${viewer.url}#page=${viewer.page}`} />}
-        {viewer.slide && <><div className="flex flex-1 items-center overflow-auto bg-muted p-4"><div className="relative mx-auto w-full overflow-hidden bg-white shadow" style={{ aspectRatio: String(viewer.slide.aspect) }}>
-          {viewer.slide.shapes.map((shape, index) => <div key={index} className="absolute overflow-hidden whitespace-pre-wrap text-[clamp(8px,1.5vw,18px)]" style={{ left: `${shape.left}%`, top: `${shape.top}%`, width: `${shape.width}%`, height: `${shape.height}%` }}>{shape.kind === "image" ? <img alt="Slide image" className="h-full w-full object-contain" src={`data:${shape.mime};base64,${shape.data}`} /> : shape.text}</div>)}
-        </div></div><div className="mt-3 flex items-center justify-center gap-4"><Button variant="outline" size="sm" disabled={viewer.page <= 1 || !!openingFile} onClick={() => void viewDocument(viewer.document, viewer.page - 1)}>Previous</Button><span className="text-sm">Slide {viewer.page} / {viewer.slide.total}</span><Button variant="outline" size="sm" disabled={viewer.page >= viewer.slide.total || !!openingFile} onClick={() => void viewDocument(viewer.document, viewer.page + 1)}>Next</Button></div></>}
+    {viewer && <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-2 sm:p-4" role="dialog" aria-modal="true" aria-label={viewer.document.title}>
+      <div className="flex h-full w-full flex-col rounded-xl bg-white p-3 shadow-xl">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2"><h2 className="truncate font-semibold">{viewer.document.title}</h2><div className="flex items-center gap-2">
+          <Button variant="outline" size="sm" onClick={() => setZoom(value => Math.max(50, value - 25))} aria-label="Zoom out">?</Button><span className="text-sm">{zoom}%</span><Button variant="outline" size="sm" onClick={() => setZoom(value => Math.min(250, value + 25))} aria-label="Zoom in">+</Button>
+          {viewer.downloadUrl && <a className="px-2 text-sm underline" href={viewer.downloadUrl} target="_blank" rel="noopener noreferrer">Download PPTX</a>}
+          <Button variant="outline" size="sm" onClick={() => setViewer(null)}>Close</Button></div></div>
+        <iframe title={viewer.document.title} className="w-full flex-1" src={`${viewer.url}#page=${viewer.page}&zoom=${zoom}`} />
       </div>
     </div>}
     <div className="grid items-start gap-6 xl:grid-cols-[290px_minmax(0,1fr)]">

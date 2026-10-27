@@ -121,7 +121,7 @@ async function refreshSession() {
   await refreshPromise;
 }
 
-async function request<T>(path: string, init: RequestInit = {}, authenticated = true, byok = false): Promise<T> {
+async function request<T>(path: string, init: RequestInit = {}, authenticated = true, byok = false, binary = false): Promise<T> {
   const startedRevision = revision;
   if (authenticated) {
     await refreshSession();
@@ -152,6 +152,7 @@ async function request<T>(path: string, init: RequestInit = {}, authenticated = 
       503: "The model or API key is unavailable. Check your key or try again later.",
     };
     if (response.status === 401 && authenticated) expireSession();
+    if (path.endsWith("/preview") && response.status === 503) throw new ApiError("PowerPoint preview requires LibreOffice on the backend, or conversion failed.", 503);
     if (init.method === "DELETE" && response.status === 503) {
       const body = await response.json().catch(() => null);
       const safeReasons = [
@@ -170,6 +171,7 @@ async function request<T>(path: string, init: RequestInit = {}, authenticated = 
     // Provider response bodies can contain diagnostics; display only fixed messages.
     throw new ApiError(messages[response.status] || "The backend could not complete this request.", response.status);
   }
+  if (binary) return response.blob() as Promise<T>;
   return response.json() as Promise<T>;
 }
 
@@ -185,12 +187,13 @@ export const api = {
   documents: (id: number) => cached(`documents:${id}`, () => request<Document[]>(`/modules/${id}/documents`)),
   overview: (id: number) => cached(`overview:${id}`, () => request<Overview>(`/subjects/${id}/overview`)),
   document: (id: string) => request<Document>(`/documents/${id}`),
+  preview: (id: string) => request<Blob>(`/documents/${id}/preview`, {}, true, false, true),
   slide: (id: string, number: number) => request<Slide>(`/documents/${id}/slides/${number}`),
   fileUrl: (id: string) => request<{ url: string }>(`/documents/${id}/file-url`),
   testKey: () => request<{ ok: boolean }>("/me/test-key", { method: "POST" }, true, true),
   ask: (question: string, subjectId: number, moduleId: number | null, documentId: string | null, mode: "normal" | "strict" = "normal", history: Message[] = []) =>
     request<Answer>("/ask", { method: "POST", body: JSON.stringify({
-      question, subject_id: subjectId, module_id: moduleId, document_id: documentId, mode, history: history.slice(-6).map(({ role, content }) => ({ role, content: content.slice(0, 2000) })),
+      question, subject_id: subjectId, module_id: moduleId, document_id: documentId, mode, history: history.slice(-6).map(({ role, content, sources }) => ({ role, content: content.slice(0, 2000), sources: sources?.slice(0, 5) || [] })),
     }) }, true, true).then(value => { invalidateData("usage"); return value; }),
   upload: (data: FormData) => request<Document>("/documents", { method: "POST", body: data }).then(value => { invalidateData("documents"); return value; }),
   deleteDocument: (id: string) => request<{ deleted: boolean; id: string }>(`/documents/${id}`, { method: "DELETE" }).then(value => { invalidateData("documents"); return value; }),

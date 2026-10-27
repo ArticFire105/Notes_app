@@ -67,9 +67,21 @@ class DocumentOut(BaseModel):
     file_type: Literal["pdf", "pptx"] = "pdf"
 
 
+class Source(BaseModel):
+    document_id: UUID | None = None
+    n: int
+    document: str
+    module: int | None
+    page: int
+    score: float
+    page_label: str | None = None
+
+
+
 class ChatTurn(BaseModel):
     role: Literal["user", "assistant"]
     content: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)]
+    sources: list[Source] = Field(default_factory=list, max_length=5)
 
 
 class AskRequest(BaseModel):
@@ -81,14 +93,6 @@ class AskRequest(BaseModel):
     history: list[ChatTurn] = Field(default_factory=list, max_length=6)
 
 
-class Source(BaseModel):
-    document_id: UUID | None = None
-    n: int
-    document: str
-    module: int | None
-    page: int
-    score: float
-    page_label: str | None = None
 
 
 class Usage(BaseModel):

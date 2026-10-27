@@ -241,7 +241,7 @@ def test_empty_retrieval_returns_reservation(api):
     client, mocks = api
     mocks.generate.return_value = {"answer": NOT_FOUND, "sources": [],
                                    "usage": {"input_tokens": 0, "output_tokens": 0}}
-    assert post(client).status_code == 200
+    assert client.post("/ask", json={"question": "paging", "subject_id": 1, "mode": "strict"}).status_code == 200
     mocks.release.assert_called_once_with(USER["id"], DAY)
     mocks.record.assert_not_called()
 
@@ -331,7 +331,7 @@ def test_zero_context_capacity_skips_model(monkeypatch):
     monkeypatch.setattr(answer, "retrieve", lambda *args: [hit])
     constructor = MagicMock()
     monkeypatch.setattr(answer, "get_chat_model", constructor)
-    assert answer.answer_question("paging", 1)["sources"] == []
+    assert answer.answer_question("paging", 1, mode="strict")["sources"] == []
     constructor.assert_not_called()
 
 

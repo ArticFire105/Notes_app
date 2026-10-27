@@ -104,7 +104,8 @@ def ask(request: AskRequest, user=Depends(get_current_user), api_key=Depends(use
                                  request.document_id, **options)
     if api_key is None:
         # Rewriting a follow-up is a model call even when no notes are found.
-        if not result["sources"] and not request.history and not small_talk:
+        if (not result["sources"] and not request.history and not small_talk
+                and request.mode == "strict" and not result.get("model_called", False)):
             quota.release_empty(user["id"], day)
         else:
             quota.record_usage(user["id"], **result["usage"], day=day)
