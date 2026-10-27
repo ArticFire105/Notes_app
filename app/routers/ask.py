@@ -40,7 +40,7 @@ from app import cache, quota
 from app.auth import get_current_user
 from app.db import get_conn
 from app.llm import user_api_key
-from app.rag.answer import answer_question
+from app.rag.answer import answer_question, answer_small_talk, is_small_talk
 from app.schemas import AskRequest, AskResponse
 
 router = APIRouter()
@@ -75,13 +75,16 @@ def check_scope(request: AskRequest):
 def ask(request: AskRequest, user=Depends(get_current_user), api_key=Depends(user_api_key)):
     # Validate → cache → BYOK or reserve quota → retrieve → answer → usage → cache → remaining.
     check_scope(request)
-    version = cache.scope_version(request.subject_id)
-    key = cache.make_key(
-        request.question, request.subject_id, request.module_id, request.document_id, version, request.mode
-    )
-    result = cache.get(key)
-    if result is not None:
-        return {**result, "remaining": quota.remaining(user["id"])}
+    small_talk = is_small_talk(request.question)
+    key = None
+    # Conversations are private and context-dependent, so they never use the shared cache.
+    if not request.history and not small_talk:
+        version = cache.scope_version(request.subject_id)
+        key = cache.make_key(request.question, request.subject_id, request.module_id,
+                             request.document_id, version, request.mode)
+        result = cache.get(key)
+        if result is not None:
+            return {**result, "remaining": quota.remaining(user["id"])}
     day = None
     if api_key is None:
         day = quota.dubai_day()
@@ -89,20 +92,23 @@ def ask(request: AskRequest, user=Depends(get_current_user), api_key=Depends(use
             if not quota.global_ok(day=day):
                 raise HTTPException(429, "Today's shared allowance or budget was reached. Add your own Google AI Studio key in Settings to keep going.")
             raise HTTPException(429, "You've used your daily questions. Add your own free Google AI Studio key in Settings to keep going.")
-    if api_key is None:
-        result = answer_question(
-            request.question, request.subject_id, request.module_id, request.document_id, mode=request.mode
-        )
+    if small_talk:
+        result = answer_small_talk(request.question, api_key=api_key)
     else:
-        result = answer_question(
-            request.question, request.subject_id, request.module_id, request.document_id,
-            api_key=api_key, mode=request.mode,
-        )
+        options = {"mode": request.mode}
+        if api_key is not None:
+            options["api_key"] = api_key
+        if request.history:
+            options["history"] = [turn.model_dump() for turn in request.history]
+        result = answer_question(request.question, request.subject_id, request.module_id,
+                                 request.document_id, **options)
     if api_key is None:
-        if not result["sources"]:
+        # Rewriting a follow-up is a model call even when no notes are found.
+        if not result["sources"] and not request.history and not small_talk:
             quota.release_empty(user["id"], day)
         else:
             quota.record_usage(user["id"], **result["usage"], day=day)
-    cache.put(key, request.subject_id, request.module_id, request.document_id, result)
+    if key is not None:
+        cache.put(key, request.subject_id, request.module_id, request.document_id, result)
     return {**result, "remaining": quota.remaining(user["id"])}
 

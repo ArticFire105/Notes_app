@@ -38,7 +38,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { CheckCircle2, FileText, Upload, LoaderCircle, AlertCircle } from "lucide-react";
-import { api, errorMessage, type Document, type Module, type Subject } from "@/lib/api";
+import { api, errorMessage, invalidateData, type Document, type Module, type Subject } from "@/lib/api";
 import { useSession } from "@/components/session-provider";
 import { DocumentManager } from "@/components/document-manager";
 import { Button } from "@/components/ui/button";
@@ -94,6 +94,7 @@ export default function UploadPage() {
         if (!active) return;
         setUpload(current); setError("");
         if (current.status !== "processing") {
+          invalidateData("documents");
           setDocumentVersion(value => value + 1);
           return;
         }

@@ -39,14 +39,43 @@ export type Profile = { email: string; role: string };
 export type Subject = { id: number; code: string; name: string };
 export type Module = { id: number; subject_id: number; number: number; title: string };
 export type Document = { id: string; title: string; module: number | null; status: "processing" | "ready" | "failed"; page_count: number | null; file_type: "pdf" | "pptx"; error?: string | null };
+export type Overview = { subject: Subject; modules: Module[]; documents: (Document & { module_id: number })[]; usage: Usage };
 export type Usage = { used: number; limit: number; resets_at: string };
-export type Source = { n: number; document: string; module: number | null; page: number; page_label?: string | null; score: number };
+export type Slide = { number: number; total: number; aspect: number; shapes: { kind: "text" | "image"; left: number; top: number; width: number; height: number; text?: string; data?: string; mime?: string }[] };
+export type Source = { document_id?: string | null; n: number; document: string; module: number | null; page: number; page_label?: string | null; score: number };
 export type Answer = { answer: string; sources: Source[]; remaining: number };
 export type Message = { role: "user" | "assistant"; content: string; sources?: Source[] };
 
 let session: Session | null = null;
 let userKey = "";
 let revision = 0;
+const cache = new Map<string, { value: unknown; expires: number }>();
+const pending = new Map<string, Promise<unknown>>();
+let cacheRevision = 0;
+
+export function invalidateData(scope: "all" | "documents" | "usage" = "all") {
+  for (const key of cache.keys()) {
+    if (scope === "all" || key.startsWith("overview:") || (scope === "documents" && key.startsWith("documents:"))) cache.delete(key);
+  }
+  // In-flight requests started before a mutation must not repopulate stale data.
+  cacheRevision += 1;
+  pending.clear();
+}
+
+async function cached<T>(key: string, load: () => Promise<T>): Promise<T> {
+  const entry = cache.get(key);
+  if (entry && entry.expires > Date.now()) return entry.value as T;
+  const existing = pending.get(key);
+  if (existing) return existing as Promise<T>;
+  const started = cacheRevision;
+  const promise = load().then(value => {
+    if (started === cacheRevision) cache.set(key, { value, expires: Date.now() + 60000 });
+    return value;
+  }).finally(() => { if (pending.get(key) === promise) pending.delete(key); });
+  pending.set(key, promise);
+  return promise;
+}
+
 let refreshPromise: Promise<void> | null = null;
 
 const baseUrl = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000").replace(/\/$/, "");
@@ -65,6 +94,7 @@ export function clearSession() {
   revision += 1;
   session = null;
   userKey = "";
+  invalidateData();
 }
 
 function expireSession() {
@@ -150,18 +180,20 @@ export const api = {
   verifyCode: (email: string, code: string) => request<Session>("/auth/verify", { method: "POST", body: JSON.stringify({ email, code }) }, false),
   me: () => request<Profile>("/me"),
   usage: () => request<Usage>("/me/usage"),
-  subjects: () => request<Subject[]>("/subjects"),
-  modules: (id: number) => request<Module[]>(`/subjects/${id}/modules`),
-  documents: (id: number) => request<Document[]>(`/modules/${id}/documents`),
+  subjects: () => cached("subjects", () => request<Subject[]>("/subjects")),
+  modules: (id: number) => cached(`modules:${id}`, () => request<Module[]>(`/subjects/${id}/modules`)),
+  documents: (id: number) => cached(`documents:${id}`, () => request<Document[]>(`/modules/${id}/documents`)),
+  overview: (id: number) => cached(`overview:${id}`, () => request<Overview>(`/subjects/${id}/overview`)),
   document: (id: string) => request<Document>(`/documents/${id}`),
+  slide: (id: string, number: number) => request<Slide>(`/documents/${id}/slides/${number}`),
   fileUrl: (id: string) => request<{ url: string }>(`/documents/${id}/file-url`),
   testKey: () => request<{ ok: boolean }>("/me/test-key", { method: "POST" }, true, true),
-  ask: (question: string, subjectId: number, moduleId: number | null, documentId: string | null, mode: "normal" | "strict" = "normal") =>
+  ask: (question: string, subjectId: number, moduleId: number | null, documentId: string | null, mode: "normal" | "strict" = "normal", history: Message[] = []) =>
     request<Answer>("/ask", { method: "POST", body: JSON.stringify({
-      question, subject_id: subjectId, module_id: moduleId, document_id: documentId, mode,
-    }) }, true, true),
-  upload: (data: FormData) => request<Document>("/documents", { method: "POST", body: data }),
-  deleteDocument: (id: string) => request<{ deleted: boolean; id: string }>(`/documents/${id}`, { method: "DELETE" }),
+      question, subject_id: subjectId, module_id: moduleId, document_id: documentId, mode, history: history.slice(-6).map(({ role, content }) => ({ role, content: content.slice(0, 2000) })),
+    }) }, true, true).then(value => { invalidateData("usage"); return value; }),
+  upload: (data: FormData) => request<Document>("/documents", { method: "POST", body: data }).then(value => { invalidateData("documents"); return value; }),
+  deleteDocument: (id: string) => request<{ deleted: boolean; id: string }>(`/documents/${id}`, { method: "DELETE" }).then(value => { invalidateData("documents"); return value; }),
 };
 
 export function errorMessage(error: unknown) {

@@ -56,7 +56,7 @@ def scope_version(subject_id):
 
 def make_key(question, subject_id, module_id=None, document_id=None, version="", mode="normal"):
     normalized = " ".join(question.lower().split())
-    value = [normalized, subject_id, module_id, str(document_id) if document_id else None, version, mode, "prompt-v2"]
+    value = [normalized, subject_id, module_id, str(document_id) if document_id else None, version, mode, "prompt-v3"]
     return hashlib.sha256(json.dumps(value, separators=(",", ":")).encode()).hexdigest()
 
 

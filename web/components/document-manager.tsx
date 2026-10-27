@@ -38,7 +38,7 @@
 
 import { useEffect, useState } from "react";
 import { RefreshCw, Trash2 } from "lucide-react";
-import { api, errorMessage, type Document } from "@/lib/api";
+import { api, errorMessage, invalidateData, type Document } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 
@@ -59,10 +59,9 @@ export function DocumentManager({ subjectId, subjectCode, version, onDeleted }: 
     setLoading(true);
     async function load() {
       try {
-        const modules = await api.modules(subjectId);
-        const groups = await Promise.all(modules.map(async module =>
-          (await api.documents(module.id)).map(document => ({ ...document, moduleNumber: module.number }))));
-        if (active) setDocuments(groups.flat());
+        const overview = await api.overview(subjectId);
+        const numbers = new Map(overview.modules.map(module => [module.id, module.number]));
+        if (active) setDocuments(overview.documents.map(document => ({ ...document, moduleNumber: numbers.get(document.module_id) ?? 0 })));
       } catch (error) { if (active) setError(errorMessage(error)); }
       finally { if (active) setLoading(false); }
     }
@@ -83,7 +82,7 @@ export function DocumentManager({ subjectId, subjectCode, version, onDeleted }: 
   }
 
   return <Card>
-    <CardHeader><div className="flex items-center justify-between gap-3"><CardTitle>Documents in {subjectCode}</CardTitle><Button type="button" variant="ghost" size="sm" disabled={loading || !!deleting} onClick={() => { setError(""); setRefresh(value => value + 1); }}><RefreshCw size={15} />Refresh</Button></div><CardDescription>Choose a subject above to manage its uploaded PDF and PowerPoint documents.</CardDescription></CardHeader>
+    <CardHeader><div className="flex items-center justify-between gap-3"><CardTitle>Documents in {subjectCode}</CardTitle><Button type="button" variant="ghost" size="sm" disabled={loading || !!deleting} onClick={() => { invalidateData("documents"); setError(""); setRefresh(value => value + 1); }}><RefreshCw size={15} />Refresh</Button></div><CardDescription>Choose a subject above to manage its uploaded PDF and PowerPoint documents.</CardDescription></CardHeader>
     <CardContent className="space-y-3">
       {error && <p role="alert" className="rounded-lg bg-red-50 p-3 text-sm text-red-800">{error}</p>}
       {notice && <p role="status" className="rounded-lg bg-emerald-50 p-3 text-sm text-emerald-800">{notice}</p>}

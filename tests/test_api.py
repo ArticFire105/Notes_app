@@ -637,3 +637,58 @@ def test_storage_backup_and_restore_helpers_use_private_bucket(monkeypatch):
         "content-type": documents.PPTX_CONTENT_TYPE, "upsert": "true",
     })
 
+
+
+def test_subject_overview_returns_documents_and_usage(client, backend, monkeypatch, record):
+    backend.cursor.fetchone.return_value = {"id": 1, "code": "OS", "name": "Operating Systems"}
+    backend.cursor.fetchall.side_effect = [[{"id": 12, "subject_id": 1, "number": 2, "title": "Memory"}], [{**record, "module_id": 12}]]
+    monkeypatch.setattr(subjects.quota, "user_usage", lambda user_id: {"used": 1, "limit": 5, "resets_at": "tomorrow"})
+    result = client.get("/subjects/1/overview")
+    assert result.status_code == 200
+    assert result.json()["documents"][0]["module_id"] == 12
+    assert result.json()["usage"]["used"] == 1
+
+
+def test_cors_preflight_is_cached(client):
+    result = client.options("/ask", headers={"Origin": "http://localhost:3000", "Access-Control-Request-Method": "POST"})
+    assert result.headers["access-control-max-age"] == "86400"
+
+
+def test_followup_bypasses_shared_cache(client, backend, monkeypatch):
+    backend.cursor.fetchone.return_value = (1,)
+    lookup = MagicMock()
+    store = MagicMock()
+    monkeypatch.setattr(ask.cache, "get", lookup)
+    monkeypatch.setattr(ask.cache, "put", store)
+    response = client.post("/ask", json={"question": "Explain it", "subject_id": 1,
+                            "mode": "strict", "history": [{"role": "user", "content": "What is paging?"}]})
+    assert response.status_code == 200
+    lookup.assert_not_called()
+    store.assert_not_called()
+    assert backend.generate.call_args.kwargs["history"][0]["content"] == "What is paging?"
+
+
+def test_small_talk_skips_retrieval_and_accounts_for_model_call(client, backend, monkeypatch):
+    backend.cursor.fetchone.return_value = (1,)
+    talk = MagicMock(return_value={"answer": "Hello!", "sources": [], "usage": {"input_tokens": 4, "output_tokens": 2}})
+    monkeypatch.setattr(ask, "answer_small_talk", talk)
+    result = client.post("/ask", json={"question": "Hi!", "subject_id": 1})
+    assert result.status_code == 200
+    assert result.json()["sources"] == []
+    backend.generate.assert_not_called()
+    ask.quota.record_usage.assert_called_once()
+
+
+def test_presentation_viewer_returns_requested_slide(client, monkeypatch):
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+    slide.shapes.add_textbox(10000, 20000, 300000, 400000).text_frame.text = "Paging"
+    output = BytesIO()
+    presentation.save(output)
+    monkeypatch.setattr(documents, "get_document", lambda document_id: {"storage_path": "notes/test.pptx"})
+    monkeypatch.setattr(documents, "download_document", lambda path: output.getvalue())
+    response = client.get(f"/documents/{DOCUMENT_ID}/slides/1")
+    assert response.status_code == 200
+    assert response.json()["shapes"][0]["text"] == "Paging"
+    assert response.json()["total"] == 1
+    assert client.get(f"/documents/{DOCUMENT_ID}/slides/2").status_code == 404

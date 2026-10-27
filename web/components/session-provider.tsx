@@ -48,6 +48,7 @@ type SessionContext = {
   logout: () => void;
   saveKey: (key: string) => void;
   appendChat: (id: number, messages: Message[]) => void;
+  clearChat: (id: number) => void;
 };
 const Context = createContext<SessionContext | null>(null);
 
@@ -95,7 +96,11 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     setHistories(previous => ({ ...previous, [id]: [...(previous[id] || []), ...messages] }));
   }, []);
 
-  return <Context.Provider value={{ profile, loading, savedKey, histories, signIn, logout, saveKey, appendChat }}>
+  const clearChat = useCallback((id: number) => {
+    setHistories(previous => ({ ...previous, [id]: [] }));
+  }, []);
+
+  return <Context.Provider value={{ profile, loading, savedKey, histories, signIn, logout, saveKey, appendChat, clearChat }}>
     {children}
   </Context.Provider>;
 }

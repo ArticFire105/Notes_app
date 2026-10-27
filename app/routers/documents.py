@@ -43,6 +43,12 @@ from psycopg.rows import dict_row
 from pypdf import PdfReader
 
 from app.db import get_conn
+import base64
+from io import BytesIO
+
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+
 from app.cache import invalidate_scope
 from app.auth import require_role
 from app.ingest.pipeline import IngestError, ingest_document
@@ -275,3 +281,36 @@ def document_pdf_url(document_id: UUID):
         raise HTTPException(404, "This document has no stored file; upload it through the API.")
     return {"url": signed_url(document["storage_path"])}
 
+
+
+@router.get("/documents/{document_id}/slides/{number}")
+def document_slide(document_id: UUID, number: int):
+    document = get_document(document_id)
+    path = document.get("storage_path")
+    if not path or not path.lower().endswith(".pptx"):
+        raise HTTPException(404, "Presentation not found.")
+    try:
+        presentation = Presentation(BytesIO(download_document(path)))
+        if number < 1 or number > len(presentation.slides):
+            raise HTTPException(404, "Slide not found.")
+        width, height = presentation.slide_width, presentation.slide_height
+        shapes = []
+        for shape in presentation.slides[number - 1].shapes:
+            item = {"left": shape.left / width * 100, "top": shape.top / height * 100,
+                    "width": shape.width / width * 100, "height": shape.height / height * 100}
+            if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                image = shape.image
+                if image.content_type not in {"image/png", "image/jpeg", "image/gif"}:
+                    continue
+                item.update(kind="image", data=base64.b64encode(image.blob).decode("ascii"), mime=image.content_type)
+            elif shape.has_text_frame and shape.text_frame.text.strip():
+                item.update(kind="text", text=shape.text_frame.text)
+            else:
+                continue
+            shapes.append(item)
+        return {"number": number, "total": len(presentation.slides),
+                "aspect": width / height, "shapes": shapes}
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(503, "Could not display this slide.") from None

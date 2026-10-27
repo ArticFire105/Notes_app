@@ -34,10 +34,13 @@ Run the API from the repository root.
 Use uv run pytest for the offline test suite.
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from psycopg.rows import dict_row
 
+from app import quota
+from app.auth import get_current_user
 from app.db import get_conn
+from app.routers.documents import DOCUMENT_COLUMNS
 from app.schemas import Module, Subject
 
 router = APIRouter()
@@ -64,3 +67,22 @@ def list_modules(subject_id: int):
             )
             return cursor.fetchall()
 
+
+
+@router.get("/subjects/{subject_id}/overview")
+def subject_overview(subject_id: int, user=Depends(get_current_user)):
+    with get_conn() as connection:
+        with connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute("select id, code, name from subjects where id = %s", (subject_id,))
+            subject = cursor.fetchone()
+            if subject is None:
+                raise HTTPException(404, "Subject not found.")
+            cursor.execute("select id, subject_id, number, title from modules where subject_id = %s order by number", (subject_id,))
+            modules = cursor.fetchall()
+            cursor.execute("select " + DOCUMENT_COLUMNS + """, d.module_id
+                           from documents d left join modules m on m.id = d.module_id
+                           where d.subject_id = %s and d.source_type = 'official'
+                           order by d.created_at desc""", (subject_id,))
+            documents = cursor.fetchall()
+    return {"subject": subject, "modules": modules, "documents": documents,
+            "usage": quota.user_usage(user["id"])}

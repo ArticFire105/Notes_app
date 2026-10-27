@@ -59,7 +59,7 @@ test("scope IDs and BYOK travel only to the backend with the correct headers", a
   assert.equal(calls[0].init.cache, "no-store");
   assert.equal(calls[0].init.redirect, "error");
   assert.deepEqual(JSON.parse(calls[0].init.body), {
-    question: "What is paging?", subject_id: 1, module_id: 12, document_id: "fake-document", mode: "normal",
+    question: "What is paging?", subject_id: 1, module_id: 12, document_id: "fake-document", mode: "normal", history: [],
   });
   assert.equal(calls[1].init.headers.has("X-User-Api-Key"), false);
 });
@@ -159,4 +159,42 @@ test("restore uses cookie credentials and strict mode is sent to the backend", a
   assert.equal(calls[0].init.headers.get("X-Browser-Session"), "1");
   assert.equal(calls[0].init.body, undefined);
   assert.equal(JSON.parse(calls[1].init.body).mode, "strict");
+});
+
+
+test("subject data is shared across navigation and invalidated after changes", async () => {
+  saveSession(session);
+  let reads = 0;
+  globalThis.fetch = async (url, init) => {
+    if (url.endsWith("/overview")) { reads++; return Response.json({}); }
+    return Response.json({ deleted: true });
+  };
+  await Promise.all([api.overview(1), api.overview(1)]);
+  await api.overview(1);
+  assert.equal(reads, 1);
+  await api.deleteDocument("fake-document");
+  await api.overview(1);
+  assert.equal(reads, 2);
+});
+
+
+test("follow-up sends recent text without source metadata", async () => {
+  saveSession(session);
+  globalThis.fetch = async (url, init) => {
+    const body = JSON.parse(init.body);
+    assert.deepEqual(body.history, [{ role: "user", content: "What is paging?" }]);
+    return Response.json({ answer: "Answer", sources: [], remaining: 4 });
+  };
+  await api.ask("Explain it", 1, null, null, "strict", [{ role: "user", content: "What is paging?", sources: [] }]);
+});
+
+
+test("slide viewer requests the cited slide with authorization", async () => {
+  saveSession(session);
+  globalThis.fetch = async (url, init) => {
+    assert.ok(url.endsWith("/documents/doc-1/slides/5"));
+    assert.equal(init.headers.get("Authorization"), "Bearer fake-access");
+    return Response.json({ number: 5, total: 8, aspect: 1.7, shapes: [] });
+  };
+  assert.equal((await api.slide("doc-1", 5)).number, 5);
 });
