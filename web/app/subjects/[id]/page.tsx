@@ -40,13 +40,26 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { ArrowLeft, ArrowUpRight, BookOpen, FileText, Send, Sparkles, Layers, ChevronDown } from "lucide-react";
-import { api, errorMessage, type Subject, type Module, type Document, type Usage, type Source } from "@/lib/api";
+import { api, errorMessage, processNote, type PersonalNote, type Subject, type Module, type Document, type Usage, type Source } from "@/lib/api";
 import { useSession } from "@/components/session-provider";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 
 type Scope = "module" | "document" | "subject";
+
+function Figure({ id }: { id: string }) {
+  const [url, setUrl] = useState("");
+  useEffect(() => {
+    let active = true;
+    let objectUrl = "";
+    api.figure(id).then(blob => {
+      if (active) { objectUrl = URL.createObjectURL(blob); setUrl(objectUrl); }
+    }).catch(() => {});
+    return () => { active = false; if (objectUrl) URL.revokeObjectURL(objectUrl); };
+  }, [id]);
+  return url ? <img src={url} alt="Diagram from the cited notes" className="mt-2 max-h-80 max-w-full rounded-lg border" /> : null;
+}
 
 export default function SubjectPage() {
   const { id } = useParams<{ id: string }>();
@@ -60,6 +73,10 @@ export default function SubjectPage() {
   const [mode, setMode] = useState<"normal" | "strict">("normal");
   const [scope, setScope] = useState<Scope>("module");
   const [usage, setUsage] = useState<Usage | null>(null);
+  const [personalNote, setPersonalNote] = useState<PersonalNote | null>(null);
+  const [noteFile, setNoteFile] = useState<File | null>(null);
+  const [noteStage, setNoteStage] = useState("");
+  const [noteBusy, setNoteBusy] = useState(false);
   const [question, setQuestion] = useState("");
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -77,9 +94,11 @@ export default function SubjectPage() {
         setError("Choose a valid subject from Home."); setLoading(false); return;
       }
       try {
-        const overview = await api.overview(subjectId);
+        const [overview, notes] = await Promise.all([api.overview(subjectId), api.notes().catch(() => null)]);
         if (!active) return;
         setSubject(overview.subject);
+        setPersonalNote(notes?.find(note => note.subject_id === subjectId) || null);
+        if (!notes) setError("Could not load your personal note. You can still use course notes.");
         setModules(overview.modules);
         const groups: Record<number, Document[]> = {};
         for (const document of overview.documents) {
@@ -125,12 +144,43 @@ export default function SubjectPage() {
     finally { setOpeningFile(""); }
   }
 
-  function openSource(source: Source) {
+  async function openSource(source: Source) {
+    if (source.source_type === "personal" && source.document_id) {
+      try {
+        const { url } = await api.noteFile(source.document_id);
+        if (!["http:", "https:"].includes(new URL(url).protocol)) throw new Error("Unsupported URL");
+        setViewer({ document: { id: source.document_id, title: "My note", module: null, status: "ready", page_count: null, file_type: "pdf" }, page: source.page, url });
+        setZoom(100);
+      } catch (error) { setError(errorMessage(error)); }
+      return;
+    }
     const all = Object.values(documents).flat();
     const document = all.find(item => item.id === source.document_id) ||
       all.find(item => item.title === source.document && item.module === source.module);
     if (document) void viewDocument(document, source.page);
     else setError("This source is no longer available.");
+  }
+
+  async function replaceNote(event: React.FormEvent) {
+    event.preventDefault();
+    if (!noteFile) return;
+    setNoteBusy(true); setError("");
+    const data = new FormData();
+    data.set("subject_id", String(subjectId)); data.set("file", noteFile); data.set("replace", "true");
+    try {
+      await processNote(data, setNoteStage);
+      setPersonalNote((await api.notes()).find(note => note.subject_id === subjectId) || null);
+      setNoteFile(null);
+    } catch (error) { const message = errorMessage(error); setNoteStage(message.includes("may still") ? "Status unavailable" : "Failed"); setError(message); }
+    finally { setNoteBusy(false); }
+  }
+
+  async function deletePersonalNote() {
+    if (!window.confirm("Delete your personal note for this subject?")) return;
+    setNoteBusy(true); setError("");
+    try { await api.deleteNote(subjectId); setPersonalNote(null); setNoteStage("Note deleted."); }
+    catch (error) { setError(errorMessage(error)); }
+    finally { setNoteBusy(false); }
   }
 
   async function ask(event: React.FormEvent) {
@@ -161,7 +211,7 @@ export default function SubjectPage() {
     {viewer && <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-2 sm:p-4" role="dialog" aria-modal="true" aria-label={viewer.document.title}>
       <div className="flex h-full w-full flex-col rounded-xl bg-white p-3 shadow-xl">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2"><h2 className="truncate font-semibold">{viewer.document.title}</h2><div className="flex items-center gap-2">
-          <Button variant="outline" size="sm" onClick={() => setZoom(value => Math.max(50, value - 25))} aria-label="Zoom out">?</Button><span className="text-sm">{zoom}%</span><Button variant="outline" size="sm" onClick={() => setZoom(value => Math.min(250, value + 25))} aria-label="Zoom in">+</Button>
+          <Button variant="outline" size="sm" onClick={() => setZoom(value => Math.max(50, value - 25))} aria-label="Zoom out">-</Button><span className="text-sm">{zoom}%</span><Button variant="outline" size="sm" onClick={() => setZoom(value => Math.min(250, value + 25))} aria-label="Zoom in">+</Button>
           {viewer.downloadUrl && <a className="px-2 text-sm underline" href={viewer.downloadUrl} target="_blank" rel="noopener noreferrer">Download PPTX</a>}
           <Button variant="outline" size="sm" onClick={() => setViewer(null)}>Close</Button></div></div>
         <iframe title={viewer.document.title} className="w-full flex-1" src={`${viewer.url}#page=${viewer.page}&zoom=${zoom}`} />
@@ -169,6 +219,7 @@ export default function SubjectPage() {
     </div>}
     <div className="grid items-start gap-6 xl:grid-cols-[290px_minmax(0,1fr)]">
       <section aria-label="Module documents" className="space-y-4">
+        {personalNote && <Card><CardContent className="space-y-3 pt-5"><h2 className="font-semibold">My note</h2><Button type="button" variant="outline" size="sm" onClick={() => void openSource({ n: 1, document_id: personalNote.id, document: "My note", module: null, page: 1, score: 1, source_type: "personal" })}>View</Button><form onSubmit={replaceNote} className="space-y-2"><label htmlFor="replace-note" className="block text-sm">Choose a replacement</label><input id="replace-note" type="file" accept=".pdf,.png,.jpg,.jpeg" disabled={noteBusy} onChange={event => setNoteFile(event.target.files?.[0] || null)} className="block w-full text-xs file:mr-2 file:rounded file:border file:px-2 file:py-1" /><div className="flex gap-2"><Button type="submit" size="sm" disabled={noteBusy || !noteFile}>Replace</Button><Button type="button" variant="outline" size="sm" disabled={noteBusy} onClick={() => void deletePersonalNote()}>Delete</Button></div></form>{noteStage && <p role="status" className="text-xs">{noteBusy && <span className="mr-2 inline-block size-3 animate-spin rounded-full border-2 border-current border-t-transparent" />}{noteStage}</p>}</CardContent></Card>}
         <div className="flex items-center gap-2"><Layers size={17} /><h2 className="font-heading text-xl font-semibold">Course material</h2><span className="ml-auto text-xs text-muted-foreground">{modules.length} modules</span></div>
         {modules.map(module => <Card key={module.id} className={cn("overflow-hidden", moduleId === module.id && "border-primary/35")}>
           <details open={moduleId === module.id}>
@@ -195,7 +246,7 @@ export default function SubjectPage() {
         <CardContent className="p-0">
           <div className="max-h-[560px] min-h-80 space-y-6 overflow-y-auto p-5 sm:p-6" aria-live="polite" aria-busy={busy}>
             {!messages.length && !busy && <div className="flex min-h-64 flex-col items-center justify-center text-center"><span className="mb-5 grid size-14 place-items-center rounded-2xl border border-border bg-background"><BookOpen size={26} strokeWidth={1.3} className="text-primary" /></span><h3 className="font-heading text-xl">Start with a question.</h3><p className="mt-2 max-w-xs text-sm leading-6 text-muted-foreground">Ask about a concept, request an explanation, or connect ideas from your course notes.</p></div>}
-            {messages.map((message, index) => <div key={index} className={cn("flex", message.role === "user" ? "justify-end" : "justify-start")}><div className={cn("max-w-[95%] rounded-2xl px-4 py-3 text-sm leading-7 sm:max-w-[90%]", message.role === "user" ? "rounded-br-sm bg-primary text-white" : "w-full rounded-bl-sm border border-border bg-[#fcfbf8]")}><p className="mb-1 text-[10px] font-semibold uppercase tracking-wider opacity-60">{message.role === "user" ? "You" : "Lecture Notes"}</p><p className="whitespace-pre-wrap break-words">{message.content}</p>{message.role === "assistant" && !!message.sources?.length && <details className="mt-4 border-t border-border pt-3"><summary className="text-xs font-medium text-primary">Sources ({message.sources?.length || 0})</summary><div className="mt-3 space-y-2">{message.sources?.map(source => <button type="button" key={source.n} onClick={() => openSource(source)} className="block w-full rounded-lg bg-white p-3 text-left text-xs leading-5 text-primary underline">[{source.n}] {subject.code} · {source.module !== null ? `Module ${source.module}` : "Whole subject"} · {source.document} · {source.page_label || `p.${source.page}`} </button>)}{!message.sources?.length && <p className="text-xs text-muted-foreground">No supporting notes found in this scope.</p>}</div></details>}</div></div>)}
+            {messages.map((message, index) => <div key={index} className={cn("flex", message.role === "user" ? "justify-end" : "justify-start")}><div className={cn("max-w-[95%] rounded-2xl px-4 py-3 text-sm leading-7 sm:max-w-[90%]", message.role === "user" ? "rounded-br-sm bg-primary text-white" : "w-full rounded-bl-sm border border-border bg-[#fcfbf8]")}><p className="mb-1 text-[10px] font-semibold uppercase tracking-wider opacity-60">{message.role === "user" ? "You" : "Lecture Notes"}</p><p className="whitespace-pre-wrap break-words">{message.content}</p>{message.role === "assistant" && !!message.sources?.length && <details className="mt-4 border-t border-border pt-3"><summary className="text-xs font-medium text-primary">Sources ({message.sources?.length || 0})</summary><div className="mt-3 space-y-2">{message.sources?.map(source => <button type="button" key={source.n} onClick={() => openSource(source)} className="block w-full rounded-lg bg-white p-3 text-left text-xs leading-5 text-primary underline">[{source.n}] {subject.code} · {source.module !== null ? `Module ${source.module}` : "Whole subject"} · {source.document} · {source.page_label || `p.${source.page}`} </button>)}{message.sources?.filter(source => source.figure_id).map(source => <Figure key={source.n} id={source.figure_id!} />)}{!message.sources?.length && <p className="text-xs text-muted-foreground">No supporting notes found in this scope.</p>}</div></details>}</div></div>)}
             {busy && <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground"><Sparkles size={16} className="animate-pulse text-gold" />Looking through your notes…</p>}
             <div ref={bottom} />
           </div>

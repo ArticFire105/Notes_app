@@ -46,6 +46,7 @@ def test_real_blank_pdf_counts_every_page_as_skipped(tmp_path):
 
 @pytest.fixture
 def ingestion(monkeypatch):
+    monkeypatch.setattr(pipeline, "extract_figures", lambda *args: [])
     monkeypatch.setattr(pipeline, "Settings", lambda: SimpleNamespace(embedding_model="test-model"))
     monkeypatch.setattr(pipeline, "load_pdf_pages", lambda path: ([{"page": 2, "text": "notes"}], 1))
     chunks = [{"page": 2, "chunk_index": i, "content": f"chunk {i}"} for i in range(65)]
@@ -429,3 +430,44 @@ def test_chunk_preview_masks_secrets_before_truncating():
     assert safe_chunk_preview("pages " * 30 + "token=fake-private-value") == "[redacted: potentially sensitive text]"
     assert "private" not in safe_chunk_preview("See https://private.invalid/path for details")
     assert "PRIVATE" not in safe_chunk_preview("See HTTPS://PRIVATE.INVALID/path for details")
+
+
+def test_figure_captions_are_embedded_as_text_and_saved_with_image(ingestion, monkeypatch):
+    figure = {"page": 2, "data": b"fake-image-bytes"}
+    monkeypatch.setattr(pipeline, "extract_figures", lambda *args: [figure])
+    monkeypatch.setattr(pipeline, "describe_figure", lambda data: "The diagram shows a page table.")
+    pipeline.ingest_pdf("dummy.pdf", "OS", 2, "Memory")
+    all_texts = [item for call in ingestion.embed.call_args_list for item in call.args[0]]
+    assert all(isinstance(item, str) for item in all_texts)
+    assert any("page table" in item for item in all_texts)
+    figure_insert = next(call for call in ingestion.cursor.execute.call_args_list if "insert into course_figures" in call.args[0])
+    assert figure_insert.args[1][-1] == b"fake-image-bytes"
+    assert any("figure_id" in call.args[0] for call in ingestion.cursor.execute.call_args_list)
+
+
+def test_extract_pptx_picture_and_skip_small_icon():
+    from PIL import Image
+    from app.ingest.figures import extract_figures
+    def image(size):
+        output = BytesIO()
+        Image.new("RGB", size, "white").save(output, format="PNG")
+        output.seek(0)
+        return output
+    deck = Presentation()
+    slide = deck.slides.add_slide(deck.slide_layouts[6])
+    slide.shapes.add_picture(image((300, 300)), Inches(1), Inches(1))
+    slide.shapes.add_picture(image((20, 20)), Inches(2), Inches(2))
+    output = BytesIO()
+    deck.save(output)
+    figures = extract_figures(output.getvalue(), "pptx")
+    assert len(figures) == 1
+    assert figures[0]["page"] == 1
+    assert figures[0]["data"].startswith(b"\xff\xd8")
+
+
+def test_ocr_cleaning_removes_markup_without_losing_table_text():
+    from app.ocr import clean_ocr_text
+    result = clean_ocr_text("Heading <table><tr><td>CPU</td><td>Memory</td></tr></table> &lt;div&gt;Text&lt;/div&gt; <script>junk</script>")
+    assert "<" not in result and ">" not in result
+    assert "CPU" in result and "Memory" in result and "Text" in result
+    assert "junk" not in result

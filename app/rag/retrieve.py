@@ -63,7 +63,7 @@ def resolve_scope(subject: str, module: int | None = None) -> tuple[int, int | N
             return subject_id, row[0]
 
 
-def retrieve(question, subject_id, module_id=None, document_id=None, k=5) -> list[dict]:
+def retrieve(question, subject_id, module_id=None, document_id=None, k=5, user_id=None) -> list[dict]:
     if not question.strip() or k < 1:
         raise ValueError("Provide a nonempty question and a positive k.")
     settings = Settings()
@@ -83,7 +83,7 @@ def retrieve(question, subject_id, module_id=None, document_id=None, k=5) -> lis
     params.extend([vector, k])
     # Only fixed SQL fragments are joined; all supplied values stay parameters.
     query = """
-        select c.content, c.page, d.id as document_id, d.title as document,
+        select c.content, c.page, c.figure_id, d.id as document_id, d.title as document,
                case when lower(d.storage_path) like '%%.pptx' then 'pptx'
                     else 'pdf' end as file_type,
                s.code as subject, m.number as module, m.title as module_title,
@@ -107,12 +107,23 @@ def retrieve(question, subject_id, module_id=None, document_id=None, k=5) -> lis
                     cursor.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
             cursor.execute(query, params)
             hits = cursor.fetchall()
+            if user_id is not None:
+                cursor.execute("""select c.content, c.page, n.id as document_id, n.title as document,
+                    n.file_type, s.code as subject, null as module, null as module_title,
+                    'personal' as source_type, 1 - (c.embedding <=> %s) as score
+                    from personal_note_chunks c join personal_notes n on n.id = c.note_id
+                    join subjects s on s.id = c.subject_id
+                    where c.user_id = %s and n.user_id = %s and c.subject_id = %s
+                      and n.subject_id = %s and c.embedding_model = %s
+                    order by c.embedding <=> %s limit %s""",
+                    (vector, user_id, user_id, subject_id, subject_id, settings.embedding_model, vector, k))
+                hits = [*hits, *cursor.fetchall()]
     # Relaxed iterative scans can return slightly unordered distances.
-    return sorted(hits, key=lambda hit: hit["score"], reverse=True)
+    return sorted(hits, key=lambda hit: hit["score"], reverse=True)[:k]
 
 
 
-def previous_source_hits(sources, subject_id, module_id=None, document_id=None):
+def previous_source_hits(sources, subject_id, module_id=None, document_id=None, user_id=None):
     """Load only cited official pages still inside the selected scope."""
     hits = []
     with get_conn() as connection:
@@ -120,7 +131,24 @@ def previous_source_hits(sources, subject_id, module_id=None, document_id=None):
             for source in sources:
                 if not source.get("document_id"):
                     continue
-                cursor.execute("""select c.content, c.page, d.id as document_id, d.title as document,
+                if source.get("source_type") == "personal":
+                    if user_id is None:
+                        continue
+                    cursor.execute("""select c.content, c.page, n.id as document_id, n.title as document,
+                        n.file_type, s.code as subject, null as module, null as module_title,
+                        'personal' as source_type from personal_note_chunks c
+                        join personal_notes n on n.id = c.note_id join subjects s on s.id = c.subject_id
+                        where n.id = %s and c.page = %s and c.subject_id = %s and n.subject_id = %s
+                          and c.user_id = %s and n.user_id = %s order by c.chunk_index limit 4""",
+                        (source["document_id"], source["page"], subject_id, subject_id, user_id, user_id))
+                    rows = cursor.fetchall()
+                    if rows:
+                        hit = dict(rows[0])
+                        hit["content"] = "\n".join(row["content"] for row in rows)
+                        hit["score"] = source.get("score", 0)
+                        hits.append(hit)
+                    continue
+                cursor.execute("""select c.content, c.page, c.figure_id, d.id as document_id, d.title as document,
                     case when lower(d.storage_path) like '%%.pptx' then 'pptx' else 'pdf' end as file_type,
                     s.code as subject, m.number as module, m.title as module_title
                     from chunks c join documents d on d.id = c.document_id
@@ -129,12 +157,14 @@ def previous_source_hits(sources, subject_id, module_id=None, document_id=None):
                     and c.source_type = 'official' and d.source_type = 'official' and d.status = 'ready'
                     and (%s::int is null or c.module_id = %s)
                     and (%s::uuid is null or c.document_id = %s)
+                    and (%s::uuid is null or c.figure_id = %s)
                     order by c.chunk_index limit 4""", (source["document_id"], source["page"], subject_id,
-                    module_id, module_id, document_id, document_id))
+                    module_id, module_id, document_id, document_id, source.get("figure_id"), source.get("figure_id")))
                 rows = cursor.fetchall()
                 if rows:
                     hit = dict(rows[0])
                     hit["content"] = "\n".join(row["content"] for row in rows)
+                    hit["figure_id"] = next((row.get("figure_id") for row in rows if row.get("figure_id")), None)
                     hit["score"] = source.get("score", 0)
                     hits.append(hit)
     return hits

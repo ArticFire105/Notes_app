@@ -42,7 +42,9 @@ export type Document = { id: string; title: string; module: number | null; statu
 export type Overview = { subject: Subject; modules: Module[]; documents: (Document & { module_id: number })[]; usage: Usage };
 export type Usage = { used: number; limit: number; resets_at: string };
 export type Slide = { number: number; total: number; aspect: number; shapes: { kind: "text" | "image"; left: number; top: number; width: number; height: number; text?: string; data?: string; mime?: string }[] };
-export type Source = { document_id?: string | null; n: number; document: string; module: number | null; page: number; page_label?: string | null; score: number };
+export type NoteJob = { stage: "reading" | "indexing" | "ready" | "failed"; page: number; error?: string };
+export type PersonalNote = { id: string; subject_id: number; title: string; file_type: "pdf" | "image" };
+export type Source = { figure_id?: string | null; source_type?: "official" | "personal"; document_id?: string | null; n: number; document: string; module: number | null; page: number; page_label?: string | null; score: number };
 export type Answer = { answer: string; sources: Source[]; remaining: number };
 export type Message = { role: "user" | "assistant"; content: string; sources?: Source[] };
 
@@ -152,7 +154,21 @@ async function request<T>(path: string, init: RequestInit = {}, authenticated = 
       503: "The model or API key is unavailable. Check your key or try again later.",
     };
     if (response.status === 401 && authenticated) expireSession();
+    if (/^\/subjects\/\d+\/modules$/.test(path) && init.method === "POST" && response.status === 409) throw new ApiError("This module number already exists.", 409);
+    if (path === "/subjects" && init.method === "POST" && response.status === 409) throw new ApiError("A subject with this code already exists.", 409);
+    if (path.startsWith("/notes/jobs/") && response.status === 404) throw new ApiError("Processing status is unavailable. The server may have restarted; check My Notes before retrying.", 404);
+    if (path === "/notes/jobs" && response.status === 413) throw new ApiError("Your note must be 20 MB or smaller.", 413);
+    if (path === "/notes" && response.status === 409) throw new ApiError("You already have a note for this subject. Choose Replace to upload a new one.", 409);
+    if (path === "/notes" && response.status === 400) throw new ApiError("Choose a readable PDF (up to 30 pages), PNG, or JPEG image.", 400);
+    if (path.startsWith("/notes/") && init.method === "DELETE" && response.status === 503) throw new ApiError("Could not delete your note. Please try again.", 503);
+    if (path === "/notes" && response.status === 503) throw new ApiError("Could not process or save your note. Check the backend OCR setup and try again.", 503);
+    if (path === "/notes" && response.status === 413) throw new ApiError("Your note must be 20 MB or smaller.", 413);
     if (path.endsWith("/preview") && response.status === 503) throw new ApiError("PowerPoint preview requires LibreOffice on the backend, or conversion failed.", 503);
+    if (init.method === "DELETE" && response.status === 503 && (/^\/subjects\/\d+$/.test(path) || /^\/modules\/\d+$/.test(path))) {
+      const body = await response.json().catch(() => null);
+      const recovery = "Deletion failed and some files could not be restored. Contact an administrator.";
+      throw new ApiError(body?.detail === recovery ? recovery : "Could not delete this item. Please try again.", 503);
+    }
     if (init.method === "DELETE" && response.status === 503) {
       const body = await response.json().catch(() => null);
       const safeReasons = [
@@ -182,11 +198,23 @@ export const api = {
   verifyCode: (email: string, code: string) => request<Session>("/auth/verify", { method: "POST", body: JSON.stringify({ email, code }) }, false),
   me: () => request<Profile>("/me"),
   usage: () => request<Usage>("/me/usage"),
+  notes: () => request<PersonalNote[]>("/notes"),
+  startNoteJob: (data: FormData, signal?: AbortSignal) => request<{ id: string }>("/notes/jobs", { method: "POST", body: data, signal }),
+  noteJob: (id: string, signal?: AbortSignal) => request<NoteJob>(`/notes/jobs/${id}`, { signal }),
+  uploadNote: (data: FormData) => request<PersonalNote>("/notes", { method: "POST", body: data }).then(value => { invalidateData("documents"); return value; }),
+  deleteNote: (subjectId: number) => request(`/notes/${subjectId}`, { method: "DELETE" }).then(value => { invalidateData("documents"); return value; }),
+  noteFile: (id: string) => request<{ url: string }>(`/notes/${id}/file-url`),
+  deleteSubject: (id: number) => request(`/subjects/${id}`, { method: "DELETE" }).then(value => { invalidateData(); return value; }),
+  createModule: (subjectId: number, number: number, title: string) => request<Module>(`/subjects/${subjectId}/modules`, { method: "POST", body: JSON.stringify({ number, title }) }).then(value => { invalidateData(); return value; }),
+  renameModule: (id: number, title: string) => request<Module>(`/modules/${id}`, { method: "PUT", body: JSON.stringify({ title }) }).then(value => { invalidateData(); return value; }),
+  deleteModule: (id: number) => request(`/modules/${id}`, { method: "DELETE" }).then(value => { invalidateData(); return value; }),
+  createSubject: (code: string, name: string) => request<Subject>("/subjects", { method: "POST", body: JSON.stringify({ code, name }) }).then(value => { invalidateData(); return value; }),
   subjects: () => cached("subjects", () => request<Subject[]>("/subjects")),
   modules: (id: number) => cached(`modules:${id}`, () => request<Module[]>(`/subjects/${id}/modules`)),
   documents: (id: number) => cached(`documents:${id}`, () => request<Document[]>(`/modules/${id}/documents`)),
   overview: (id: number) => cached(`overview:${id}`, () => request<Overview>(`/subjects/${id}/overview`)),
   document: (id: string) => request<Document>(`/documents/${id}`),
+  figure: (id: string) => request<Blob>(`/figures/${id}`, {}, true, false, true),
   preview: (id: string) => request<Blob>(`/documents/${id}/preview`, {}, true, false, true),
   slide: (id: string, number: number) => request<Slide>(`/documents/${id}/slides/${number}`),
   fileUrl: (id: string) => request<{ url: string }>(`/documents/${id}/file-url`),
@@ -198,6 +226,34 @@ export const api = {
   upload: (data: FormData) => request<Document>("/documents", { method: "POST", body: data }).then(value => { invalidateData("documents"); return value; }),
   deleteDocument: (id: string) => request<{ deleted: boolean; id: string }>(`/documents/${id}`, { method: "DELETE" }).then(value => { invalidateData("documents"); return value; }),
 };
+
+export async function processNote(data: FormData, update: (message: string) => void) {
+  update("Uploading file...");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 120000);
+  let job: { id: string };
+  try { job = await api.startNoteJob(data, controller.signal); }
+  catch (error) {
+    if (controller.signal.aborted) throw new ApiError("Upload timed out. Check your connection and try again.");
+    throw error;
+  } finally { clearTimeout(timer); }
+  const deadline = Date.now() + 30 * 60 * 1000;
+  while (Date.now() < deadline) {
+    const statusController = new AbortController();
+    const statusTimer = setTimeout(() => statusController.abort(), 30000);
+    let status: NoteJob;
+    try { status = await api.noteJob(job.id, statusController.signal); }
+    catch (error) {
+      if (statusController.signal.aborted) throw new ApiError("Status check timed out. Processing may still finish; check My Notes before retrying.");
+      throw error;
+    } finally { clearTimeout(statusTimer); }
+    if (status.stage === "ready") { invalidateData("documents"); update("Ready"); return; }
+    if (status.stage === "failed") throw new ApiError(status.error || "Processing failed. Please try again.");
+    update(status.stage === "indexing" ? "Indexing your note..." : `Reading handwriting${status.page ? ` - page ${status.page}` : "..."}`);
+    await new Promise(resolve => setTimeout(resolve, 2000));
+  }
+  throw new ApiError("Processing is taking longer than 30 minutes. It may still finish; check My Notes before retrying.");
+}
 
 export function errorMessage(error: unknown) {
   return error instanceof ApiError ? error.message : "Something went wrong. Please try again.";

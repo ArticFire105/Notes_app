@@ -83,3 +83,9 @@ def restore_document(file_bytes: bytes, path: str):
     # A timeout can happen after removal; upsert safely restores either outcome.
     return _bucket().upload(path, file_bytes, file_options={"content-type": content_type, "upsert": "true"})
 
+
+
+def personal_bucket():
+    settings = Settings()
+    client = create_client(settings.supabase_url, settings.supabase_service_role_key.get_secret_value())
+    return client.storage.from_("personal-notes")

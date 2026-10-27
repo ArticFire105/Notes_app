@@ -42,6 +42,7 @@ from app.db import get_conn
 from app.llm import user_api_key
 from app.rag.answer import answer_question, answer_small_talk, is_small_talk
 from app.schemas import AskRequest, AskResponse
+from app.routers.notes import has_note
 
 router = APIRouter()
 
@@ -76,9 +77,10 @@ def ask(request: AskRequest, user=Depends(get_current_user), api_key=Depends(use
     # Validate → cache → BYOK or reserve quota → retrieve → answer → usage → cache → remaining.
     check_scope(request)
     small_talk = is_small_talk(request.question)
+    personal = False if small_talk else has_note(user["id"], request.subject_id)
     key = None
     # Conversations are private and context-dependent, so they never use the shared cache.
-    if not request.history and not small_talk:
+    if not request.history and not small_talk and not personal:
         version = cache.scope_version(request.subject_id)
         key = cache.make_key(request.question, request.subject_id, request.module_id,
                              request.document_id, version, request.mode)
@@ -96,6 +98,8 @@ def ask(request: AskRequest, user=Depends(get_current_user), api_key=Depends(use
         result = answer_small_talk(request.question, api_key=api_key)
     else:
         options = {"mode": request.mode}
+        if personal:
+            options["user_id"] = user["id"]
         if api_key is not None:
             options["api_key"] = api_key
         if request.history:

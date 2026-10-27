@@ -68,6 +68,8 @@ class DocumentOut(BaseModel):
 
 
 class Source(BaseModel):
+    source_type: Literal["official", "personal"] = "official"
+    figure_id: UUID | None = None
     document_id: UUID | None = None
     n: int
     document: str

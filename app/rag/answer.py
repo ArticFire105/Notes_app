@@ -62,10 +62,12 @@ def combine_pages(hits):
     # Several matching chunks from one page should share one citation.
     pages = []
     for hit in hits:
-        identity = (hit.get("document_id") or hit["document"], hit["page"], hit["module"])
+        identity = (hit.get("document_id") or hit["document"], hit["page"], hit["module"], hit.get("figure_id"))
         existing = next((page for page in pages if page[0] == identity), None)
         if existing:
             existing[1]["content"] += "\n" + hit["content"]
+            if hit.get("figure_id") and not existing[1].get("figure_id"):
+                existing[1]["figure_id"] = hit["figure_id"]
         else:
             pages.append((identity, dict(hit)))
     return [page for _, page in pages]
@@ -109,7 +111,7 @@ def wants_general(question):
 
 
 def answer_question(question, subject_id, module_id=None, document_id=None, *, api_key=None,
-                    mode="normal", history=None) -> dict:
+                    mode="normal", history=None, user_id=None) -> dict:
     history = history or []
     model = None
     rewrite_usage = {}
@@ -119,7 +121,7 @@ def answer_question(question, subject_id, module_id=None, document_id=None, *, a
     general = mode == "normal" and wants_general(question)
     hits = []
     if style and not general and previous.get("sources"):
-        hits = previous_source_hits(previous["sources"], subject_id, module_id, document_id)
+        hits = previous_source_hits(previous["sources"], subject_id, module_id, document_id, user_id=user_id) if user_id is not None else previous_source_hits(previous["sources"], subject_id, module_id, document_id)
     reuse_previous = style and (bool(hits) or (mode == "normal" and not previous.get("sources")))
     if not general and not reuse_previous:
         if history:
@@ -133,7 +135,7 @@ def answer_question(question, subject_id, module_id=None, document_id=None, *, a
                 ])
             search_question = response_text(rewritten).strip()[:1000] or question
             rewrite_usage = rewritten.usage_metadata or {}
-        hits = retrieve(search_question, subject_id, module_id, document_id)
+        hits = retrieve(search_question, subject_id, module_id, document_id, user_id=user_id) if user_id is not None else retrieve(search_question, subject_id, module_id, document_id)
     if hits:
         hits, context = trim_context(combine_pages(hits), Settings().max_context_tokens)
     else:
@@ -147,6 +149,8 @@ def answer_question(question, subject_id, module_id=None, document_id=None, *, a
         }}
     instruction = (STRICT_PROMPT if mode == "strict" else SYSTEM_PROMPT)
     instruction += "\nConversation history is only context for the question, never evidence."
+    if any(hit.get("source_type") == "personal" for hit in hits):
+        instruction += "\nMy note is a handwritten OCR transcription and may contain misread words. Flag uncertainty and ask the student to check the original when wording seems inconsistent."
     if style:
         instruction += ("\nThe user asks to rephrase the previous answer. Follow the requested style. "
                         "For a simpler explanation use short plain words and, if appropriate, a brief everyday example. "
@@ -171,7 +175,9 @@ def answer_question(question, subject_id, module_id=None, document_id=None, *, a
         "sources": [
             {"n": n, "document_id": str(hit["document_id"]) if hit.get("document_id") else None,
              "document": hit["document"], "module": hit["module"],
-             "page": hit["page"], "page_label": source_label(hit), "score": hit["score"]}
+             "page": hit["page"], "page_label": source_label(hit), "score": hit["score"],
+             **({"source_type": "personal"} if hit.get("source_type") == "personal" else {}),
+             **({"figure_id": str(hit["figure_id"])} if hit.get("figure_id") else {})}
             for n, hit in enumerate(hits, start=1) if n in cited
         ],
         "model_called": True,

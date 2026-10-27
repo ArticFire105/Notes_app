@@ -80,6 +80,7 @@ def record():
 
 @pytest.fixture
 def backend(monkeypatch):
+    monkeypatch.setattr(ask, "has_note", lambda *args: False)
     monkeypatch.setattr(ask.cache, "scope_version", lambda subject_id: "documents-v1")
     monkeypatch.setattr(ask.cache, "get", lambda key: None)
     monkeypatch.setattr(ask.cache, "put", MagicMock())
@@ -728,3 +729,206 @@ def test_converter_uses_isolated_profile_and_cleans_temporary_files(monkeypatch)
     monkeypatch.setattr(documents.subprocess, "run", convert)
     assert documents.convert_presentation(b"pptx-data") == b"%PDF-converted"
     assert not seen["folder"].exists()
+
+
+def test_personal_answers_bypass_shared_cache(client, backend, monkeypatch):
+    backend.cursor.fetchone.return_value = (1,)
+    monkeypatch.setattr(ask, "has_note", lambda user_id, subject_id: True)
+    lookup = MagicMock()
+    store = MagicMock()
+    monkeypatch.setattr(ask.cache, "get", lookup)
+    monkeypatch.setattr(ask.cache, "put", store)
+    response = client.post("/ask", json={"question": "paging", "subject_id": 1})
+    assert response.status_code == 200
+    lookup.assert_not_called()
+    store.assert_not_called()
+    assert backend.generate.call_args.kwargs["user_id"] == DOCUMENT_ID
+
+
+def test_note_file_cannot_be_opened_by_other_users(client, monkeypatch):
+    from app.routers import notes
+    context = MagicMock()
+    cursor = context.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = None
+    monkeypatch.setattr(notes, "get_conn", context)
+    bucket = MagicMock()
+    monkeypatch.setattr(notes, "personal_bucket", bucket)
+    response = client.get(f"/notes/{DOCUMENT_ID}/file-url")
+    assert response.status_code == 404
+    assert cursor.execute.call_args.args[1] == (DOCUMENT_ID, DOCUMENT_ID)
+    bucket.assert_not_called()
+
+
+def test_note_replacement_storage_failure_restores_old_file(monkeypatch):
+    from app.routers import notes
+    context = MagicMock()
+    cursor = context.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
+    cursor.fetchone.side_effect = [(1,), ("owner/old.png", "image")]
+    monkeypatch.setattr(notes, "get_conn", context)
+    monkeypatch.setattr(notes, "validate_file", lambda *args: (".png", "image", "image/png"))
+    monkeypatch.setattr(notes, "transcribe", lambda *args: [{"page": 1, "text": "Personal handwritten notes"}])
+    embed = MagicMock(return_value=[[0.0] * 768])
+    monkeypatch.setattr(notes, "embed_documents", embed)
+    monkeypatch.setattr(notes, "Settings", lambda: SimpleNamespace(embedding_model="test-model"))
+    bucket = MagicMock()
+    bucket.download.return_value = b"old image"
+    bucket.remove.side_effect = [RuntimeError("storage failure"), None]
+    monkeypatch.setattr(notes, "personal_bucket", lambda: bucket)
+    with pytest.raises(notes.HTTPException) as error:
+        notes.save_note(b"new image", "new.png", 1, True, "owner")
+    assert error.value.status_code == 503
+    assert embed.call_args.args[0] == ["Personal handwritten notes"]
+    assert bucket.upload.call_args_list[1].args[:2] == ("owner/old.png", b"old image")
+
+
+def test_note_limit_rejected_before_ocr(monkeypatch):
+    from app.routers import notes
+    context = MagicMock()
+    cursor = context.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = (1,)
+    monkeypatch.setattr(notes, "get_conn", context)
+    monkeypatch.setattr(notes, "validate_file", lambda *args: (".png", "image", "image/png"))
+    monkeypatch.setattr(notes, "has_note", lambda *args: True)
+    ocr = MagicMock()
+    monkeypatch.setattr(notes, "transcribe", ocr)
+    with pytest.raises(notes.HTTPException) as error:
+        notes.save_note(b"image", "note.png", 1, False, "owner")
+    assert error.value.status_code == 409
+    ocr.assert_not_called()
+
+
+def test_course_figure_requires_ready_official_document(client, backend):
+    backend.cursor.fetchone.return_value = {"image_data": b"fake-jpeg", "content_type": "image/jpeg"}
+    result = client.get(f"/figures/{DOCUMENT_ID}")
+    assert result.status_code == 200
+    assert result.content == b"fake-jpeg"
+    sql, params = backend.cursor.execute.call_args.args
+    assert "d.source_type = 'official'" in sql and "d.status = 'ready'" in sql
+    assert params == (DOCUMENT_ID,)
+
+
+def test_admin_can_add_subject_with_modules(client, backend):
+    backend.cursor.fetchone.return_value = {"id": 9, "code": "AI", "name": "Artificial Intelligence"}
+    result = client.post("/subjects", json={"code": " ai ", "name": "Artificial Intelligence"})
+    assert result.status_code == 201
+    assert result.json()["code"] == "AI"
+    assert backend.cursor.executemany.call_args.args[1] == [(9, n, f"Module {n}") for n in range(1, 6)]
+
+
+def test_student_cannot_add_subject(client, backend):
+    main.app.dependency_overrides[get_current_user] = lambda: {"id": DOCUMENT_ID, "email": "student@dxb.manipal.edu", "role": "student"}
+    result = client.post("/subjects", json={"code": "AI", "name": "Artificial Intelligence"})
+    assert result.status_code == 403
+    backend.cursor.execute.assert_not_called()
+
+
+def test_duplicate_subject_code_is_reported(client, backend):
+    backend.cursor.execute.side_effect = subjects.UniqueViolation()
+    result = client.post("/subjects", json={"code": "AI", "name": "Artificial Intelligence"})
+    assert result.status_code == 409
+
+
+def test_note_processing_reports_stages_and_owner(client, monkeypatch):
+    from app.routers import notes
+    observed = []
+    def save(data, filename, subject_id, replace, user_id, progress):
+        assert subject_id == 4 and user_id == DOCUMENT_ID
+        progress("reading", 2)
+        observed.append(next(iter(notes._jobs.values()))["stage"])
+        progress("indexing", 2)
+        observed.append(next(iter(notes._jobs.values()))["stage"])
+        return {"subject_id": subject_id}
+    notes._jobs.clear()
+    monkeypatch.setattr(notes, "save_note", save)
+    response = client.post("/notes/jobs", data={"subject_id": "4", "replace": "false"},
+                           files={"file": ("notes.png", b"fake", "image/png")})
+    assert response.status_code == 202
+    job_id = response.json()["id"]
+    assert observed == ["reading", "indexing"]
+    assert client.get(f"/notes/jobs/{job_id}").json()["stage"] == "ready"
+    with pytest.raises(notes.HTTPException) as error:
+        notes.job_status(job_id, {"id": "other-user"})
+    assert error.value.status_code == 404
+    notes._jobs.clear()
+
+
+def test_admin_delete_subject_removes_official_and_private_files(client, backend, monkeypatch):
+    cursor = backend.cursor
+    cursor.fetchone.return_value = {"id": 4}
+    cursor.fetchall.side_effect = [[], [{"storage_path": "official/test.pdf"}],
+                                    [{"storage_path": "user/note.png", "file_type": "image"}]]
+    download = MagicMock(return_value=b"official")
+    remove = MagicMock()
+    bucket = MagicMock()
+    bucket.download.return_value = b"private"
+    monkeypatch.setattr(subjects, "download_document", download)
+    monkeypatch.setattr(subjects, "delete_document", remove)
+    monkeypatch.setattr(subjects, "personal_bucket", lambda: bucket)
+    response = client.delete("/subjects/4")
+    assert response.status_code == 200
+    remove.assert_called_once_with("official/test.pdf")
+    bucket.remove.assert_called_once_with(["user/note.png"])
+    sql = " ".join(call.args[0] for call in cursor.execute.call_args_list)
+    assert "delete from personal_notes" in sql and "delete from documents" in sql and "delete from subjects" in sql
+
+
+def test_scope_deletion_restores_files_after_storage_failure(client, backend, monkeypatch):
+    cursor = backend.cursor
+    cursor.fetchone.return_value = {"id": 4}
+    cursor.fetchall.side_effect = [[], [{"storage_path": "official/test.pdf"}],
+                                    [{"storage_path": "user/note.png", "file_type": "image"}]]
+    monkeypatch.setattr(subjects, "download_document", lambda path: b"official")
+    remove = MagicMock()
+    restore = MagicMock()
+    bucket = MagicMock()
+    bucket.download.return_value = b"private"
+    bucket.remove.side_effect = RuntimeError("storage failure")
+    monkeypatch.setattr(subjects, "delete_document", remove)
+    monkeypatch.setattr(subjects, "restore_document", restore)
+    monkeypatch.setattr(subjects, "personal_bucket", lambda: bucket)
+    response = client.delete("/subjects/4")
+    assert response.status_code == 503
+    restore.assert_called_once_with(b"official", "official/test.pdf")
+    assert bucket.upload.called
+
+
+@pytest.mark.parametrize("method,path,body", [
+    ("POST", "/subjects/1/modules", {"number": 6, "title": "Concurrency"}),
+    ("PUT", "/modules/12", {"title": "Concurrency"}),
+    ("DELETE", "/modules/12", None),
+    ("DELETE", "/subjects/1", None),
+])
+def test_scope_management_requires_admin(client, backend, method, path, body):
+    main.app.dependency_overrides[get_current_user] = lambda: {"id": DOCUMENT_ID, "email": "student@dxb.manipal.edu", "role": "student"}
+    response = client.request(method, path, json=body)
+    assert response.status_code == 403
+    backend.cursor.execute.assert_not_called()
+
+
+def test_admin_add_and_rename_module(client, backend):
+    backend.cursor.fetchone.side_effect = [{"id": 1}, {"id": 12, "subject_id": 1, "number": 6, "title": "Threads"}]
+    response = client.post("/subjects/1/modules", json={"number": 6, "title": "Threads"})
+    assert response.status_code == 201 and response.json()["number"] == 6
+    backend.cursor.fetchone.side_effect = None
+    backend.cursor.fetchone.return_value = {"id": 12, "subject_id": 1, "number": 6, "title": "Concurrency"}
+    response = client.put("/modules/12", json={"title": "Concurrency"})
+    assert response.status_code == 200 and response.json()["title"] == "Concurrency"
+
+
+def test_admin_delete_module_removes_documents_but_not_personal_notes(client, backend, monkeypatch):
+    cursor = backend.cursor
+    cursor.fetchone.return_value = {"subject_id": 4}
+    cursor.fetchall.return_value = [{"storage_path": "official/module.pdf"}]
+    monkeypatch.setattr(subjects, "download_document", lambda path: b"file")
+    remove = MagicMock()
+    personal = MagicMock()
+    monkeypatch.setattr(subjects, "delete_document", remove)
+    monkeypatch.setattr(subjects, "personal_bucket", personal)
+    response = client.delete("/modules/12")
+    assert response.status_code == 200
+    remove.assert_called_once_with("official/module.pdf")
+    personal.assert_not_called()
+    sql = " ".join(call.args[0] for call in cursor.execute.call_args_list)
+    assert "delete from documents where module_id" in sql
+    assert "delete from modules" in sql
+    assert "delete from personal_notes" not in sql

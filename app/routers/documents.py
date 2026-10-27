@@ -362,3 +362,16 @@ def presentation_preview(document_id: UUID):
     except Exception:
         raise HTTPException(503, "Could not load this presentation for preview.") from None
     return Response(pdf, media_type="application/pdf", headers={"Cache-Control": "no-store"})
+
+
+@router.get("/figures/{figure_id}")
+def course_figure(figure_id: UUID):
+    with get_conn() as connection:
+        with connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute("""select f.image_data, f.content_type from course_figures f
+                              join documents d on d.id = f.document_id
+                              where f.id = %s and d.source_type = 'official' and d.status = 'ready'""", (figure_id,))
+            image = cursor.fetchone()
+    if image is None:
+        raise HTTPException(404, "Figure not found.")
+    return Response(bytes(image["image_data"]), media_type=image["content_type"], headers={"Cache-Control": "private, no-store"})

@@ -49,6 +49,12 @@ export default function UploadPage() {
   const { profile } = useSession();
   const [subjects, setSubjects] = useState<Subject[]>([]);
   const [modules, setModules] = useState<Module[]>([]);
+  const [newModuleNumber, setNewModuleNumber] = useState("");
+  const [newModuleTitle, setNewModuleTitle] = useState("");
+  const [managing, setManaging] = useState(false);
+  const [newCode, setNewCode] = useState("");
+  const [newName, setNewName] = useState("");
+  const [addingSubject, setAddingSubject] = useState(false);
   const [subjectId, setSubjectId] = useState("");
   const [moduleId, setModuleId] = useState("");
   const [title, setTitle] = useState("");
@@ -106,6 +112,61 @@ export default function UploadPage() {
     return () => { active = false; clearTimeout(timer); };
   }, [uploadId, isAdmin]);
 
+  async function addSubject(event: React.FormEvent) {
+    event.preventDefault();
+    setAddingSubject(true); setError("");
+    try {
+      const subject = await api.createSubject(newCode, newName);
+      setSubjects(await api.subjects());
+      setSubjectId(String(subject.id)); setNewCode(""); setNewName("");
+    } catch (error) { setError(errorMessage(error)); }
+    finally { setAddingSubject(false); }
+  }
+
+  async function refreshModules() {
+    const list = await api.modules(Number(subjectId));
+    setModules(list); setModuleId(current => list.some(module => String(module.id) === current) ? current : String(list[0]?.id || ""));
+    setDocumentVersion(value => value + 1);
+  }
+
+  async function addModule(event: React.FormEvent) {
+    event.preventDefault();
+    if (!subjectId) return;
+    setManaging(true); setError("");
+    try { await api.createModule(Number(subjectId), Number(newModuleNumber), newModuleTitle); await refreshModules(); setNewModuleNumber(""); setNewModuleTitle(""); }
+    catch (error) { setError(errorMessage(error)); }
+    finally { setManaging(false); }
+  }
+
+  async function renameModule(module: Module) {
+    const title = window.prompt("New module title:", module.title);
+    if (!title || !title.trim()) return;
+    setManaging(true); setError("");
+    try { await api.renameModule(module.id, title.trim()); await refreshModules(); }
+    catch (error) { setError(errorMessage(error)); }
+    finally { setManaging(false); }
+  }
+
+  async function deleteModule(module: Module) {
+    if (!window.confirm(`Delete Module ${module.number}: ${module.title}? This also deletes its documents, searchable chunks, and figures.`)) return;
+    setManaging(true); setError("");
+    try { await api.deleteModule(module.id); await refreshModules(); }
+    catch (error) { setError(errorMessage(error)); }
+    finally { setManaging(false); }
+  }
+
+  async function deleteSubject() {
+    const subject = subjects.find(item => String(item.id) === subjectId);
+    if (!subject || !window.confirm(`Delete ${subject.code} - ${subject.name}? This permanently deletes all its modules, documents, figures, and every student's personal note for this subject.`)) return;
+    setManaging(true); setError("");
+    try {
+      await api.deleteSubject(subject.id);
+      const list = await api.subjects(); setSubjects(list); setSubjectId(String(list[0]?.id || ""));
+      setModules([]); setModuleId(""); setUpload(null);
+    } catch (error) { setError(errorMessage(error)); }
+    finally { setManaging(false); }
+  }
+
   async function submit(event: React.FormEvent) {
     event.preventDefault();
     if (!file || !title.trim() || !subjectId || !moduleId) { setError("Select a subject, module, title, and PDF or PPTX file."); return; }
@@ -129,6 +190,9 @@ export default function UploadPage() {
   return <div className="mx-auto max-w-3xl space-y-7">
     <div><p className="mb-2 text-xs uppercase tracking-[.2em] text-gold">Educator workspace</p><h1 className="font-heading text-3xl font-semibold">Share the material.</h1><p className="mt-3 text-sm text-muted-foreground">Upload official notes and give every good question a starting point.</p></div>
     {error && <p role="alert" className="rounded-lg bg-red-50 p-4 text-sm text-red-800">{error}</p>}
+    <Card><CardHeader><CardTitle>Add subject</CardTitle><CardDescription>Five placeholder modules are created automatically.</CardDescription></CardHeader><CardContent>
+      <form onSubmit={addSubject} className="flex flex-wrap items-end gap-3"><div className="space-y-2"><label htmlFor="subject-code">Code</label><Input id="subject-code" required maxLength={20} value={newCode} onChange={event => setNewCode(event.target.value)} placeholder="e.g. OS" /></div><div className="min-w-48 flex-1 space-y-2"><label htmlFor="subject-name">Name</label><Input id="subject-name" required maxLength={100} value={newName} onChange={event => setNewName(event.target.value)} placeholder="Subject name" /></div><Button type="submit" disabled={addingSubject}>{addingSubject ? "Adding..." : "Add subject"}</Button></form>
+    </CardContent></Card>
     <Card><CardHeader><CardTitle>Upload lecture notes</CardTitle><CardDescription>PDFs and PowerPoint (.pptx), up to 40 MB. Pick the module these notes belong to.</CardDescription></CardHeader><CardContent>
       {loading ? <p role="status" className="text-sm text-muted-foreground">Loading subjects…</p> : <form onSubmit={submit}><fieldset disabled={busy || upload?.status === "processing"} className="space-y-5">
         <div className="grid gap-4 sm:grid-cols-2"><div className="space-y-2"><label htmlFor="upload-subject">Subject</label><select id="upload-subject" value={subjectId} required onChange={event => { setSubjectId(event.target.value); setModuleId(""); setModules([]); }}><option value="" disabled>Select a subject</option>{subjects.map(subject => <option key={subject.id} value={subject.id}>{subject.code} · {subject.name}</option>)}</select></div><div className="space-y-2"><label htmlFor="upload-module">Module</label><select id="upload-module" value={moduleId} required disabled={loadingModules} onChange={event => setModuleId(event.target.value)}><option value="" disabled>{loadingModules ? "Loading modules…" : "Select a module"}</option>{modules.map(module => <option key={module.id} value={module.id}>Module {module.number} · {module.title}</option>)}</select></div></div>
@@ -138,6 +202,11 @@ export default function UploadPage() {
       </fieldset></form>}
     </CardContent></Card>
     {upload && <Card aria-live="polite"><CardContent className="flex items-start gap-4 pt-6"><span className="mt-1">{upload.status === "ready" ? <CheckCircle2 className="text-emerald-700" /> : upload.status === "failed" ? <AlertCircle className="text-red-700" /> : <LoaderCircle className="animate-spin text-gold" />}</span><div><p className="flex items-center gap-2 text-sm font-semibold"><FileText size={15} />{upload.title}</p><p className="mt-2 text-sm">{upload.status === "ready" ? "Ready. Students can now ask questions about these notes." : upload.status === "failed" ? (upload.error || "Document ingestion failed. Check backend logs for details.") : "Processing your document. Status refreshes every three seconds."}</p></div></CardContent></Card>}
+    {subjectId && <Card><CardHeader><CardTitle>Manage subject and modules</CardTitle></CardHeader><CardContent className="space-y-4">
+      <Button type="button" variant="outline" disabled={managing || busy || upload?.status === "processing"} onClick={() => void deleteSubject()}>Delete this subject</Button>
+      <form onSubmit={addModule} className="flex flex-wrap items-end gap-3"><div><label htmlFor="module-number" className="block text-sm">Number</label><Input id="module-number" type="number" min={1} max={999} required value={newModuleNumber} onChange={event => setNewModuleNumber(event.target.value)} /></div><div className="min-w-48 flex-1"><label htmlFor="module-title" className="block text-sm">Title</label><Input id="module-title" required maxLength={200} value={newModuleTitle} onChange={event => setNewModuleTitle(event.target.value)} /></div><Button type="submit" disabled={managing || !newModuleNumber || !newModuleTitle.trim()}>Add module</Button></form>
+      {modules.map(module => <div key={module.id} className="flex flex-wrap items-center gap-2 rounded-lg border p-3"><span className="min-w-0 flex-1 text-sm">Module {module.number} - {module.title}</span><Button type="button" variant="outline" size="sm" disabled={managing || busy || upload?.status === "processing"} onClick={() => void renameModule(module)}>Rename</Button><Button type="button" variant="outline" size="sm" disabled={managing || busy || upload?.status === "processing"} onClick={() => void deleteModule(module)}>Delete</Button></div>)}
+    </CardContent></Card>}
     {subjectId && <DocumentManager key={subjectId} subjectId={Number(subjectId)} subjectCode={subjects.find(subject => String(subject.id) === subjectId)?.code || "this subject"} version={documentVersion} onDeleted={id => { if (upload?.id === id) setUpload(null); }} />}
   </div>;
 }

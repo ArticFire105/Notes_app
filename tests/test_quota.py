@@ -169,6 +169,7 @@ def api(monkeypatch):
         admin=MagicMock(return_value={"total_requests": 1, "est_cost_usd": "unknown"}),
     )
     monkeypatch.setattr(ask, "check_scope", lambda request: None)
+    monkeypatch.setattr(ask, "has_note", lambda *args: False)
     monkeypatch.setattr(cache, "scope_version", lambda subject: "v1")
     monkeypatch.setattr(cache, "get", mocks.cached)
     monkeypatch.setattr(cache, "put", mocks.put)

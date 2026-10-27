@@ -77,13 +77,25 @@ def shape_text(shapes) -> list[str]:
     return texts
 
 
+def has_images(shapes):
+    for shape in shapes:
+        if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+            return True
+        if shape.shape_type == MSO_SHAPE_TYPE.GROUP and has_images(shape.shapes):
+            return True
+    return False
+
+
 def load_pptx_pages(path: str | Path | bytes) -> tuple[list[dict], int]:
     source = BytesIO(path) if isinstance(path, bytes) else Path(path).open("rb")
     pages = []
     skipped = 0
+    has_picture = False
     with source:
         presentation = Presentation(source)
         for number, slide in enumerate(presentation.slides, start=1):
+            if has_images(slide.shapes):
+                has_picture = True
             parts = [clean_slide_text(part) for part in shape_text(slide.shapes)]
             text = "\n".join(part for part in parts if part)
             # Accessing notes_slide creates one if absent; check first to keep parsing read-only.
@@ -96,6 +108,6 @@ def load_pptx_pages(path: str | Path | bytes) -> tuple[list[dict], int]:
                 pages.append({"page": number, "text": text})
             else:
                 skipped += 1
-    if not pages:
+    if not pages and not has_picture:
         raise NoReadableSlidesError(NO_READABLE_SLIDES)
     return pages, skipped

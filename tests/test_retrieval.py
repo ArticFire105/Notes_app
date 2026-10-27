@@ -138,3 +138,26 @@ def test_evaluation_rejects_empty_input():
     with pytest.raises(ValueError):
         eval_retrieval.evaluate([])
 
+
+
+def test_personal_retrieval_filters_both_note_and_chunk_owner(database):
+    cursor, embed = database
+    cursor.fetchall.side_effect = [[], [{"score": 0.9, "document": "My note", "page": 1}]]
+    result = retrieval.retrieve("paging", 1, user_id="student-a")
+    sql, params = cursor.execute.call_args.args
+    assert "c.user_id = %s and n.user_id = %s" in sql
+    assert params[1:5] == ("student-a", "student-a", 1, 1)
+    assert result[0]["document"] == "My note"
+    embed.assert_called_once()
+
+
+def test_personal_previous_source_requires_owner(database):
+    cursor, _ = database
+    source = {"document_id": "note-id", "page": 1, "source_type": "personal"}
+    assert retrieval.previous_source_hits([source], 1, user_id=None) == []
+    cursor.execute.assert_not_called()
+    cursor.fetchall.return_value = []
+    retrieval.previous_source_hits([source], 1, user_id="student-a")
+    sql, params = cursor.execute.call_args.args
+    assert "c.user_id = %s and n.user_id = %s" in sql
+    assert params[-2:] == ("student-a", "student-a")

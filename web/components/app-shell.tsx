@@ -64,7 +64,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     if (profile && loginPage) router.replace("/");
   }, [profile, loading, loginPage, router]);
   useEffect(() => { setMenuOpen(false); }, [pathname]);
-  if (loading) return <div className="grid min-h-screen place-items-center text-muted-foreground" role="status">Loading?</div>;
+  if (loading) return <div className="grid min-h-screen place-items-center text-muted-foreground" role="status">Loading...</div>;
   if (loginPage) return <>{children}</>;
   if (!profile) return <div className="grid min-h-screen place-items-center text-muted-foreground" role="status">Opening your learning portal…</div>;
   const navigation = profile.role === "admin"

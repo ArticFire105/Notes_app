@@ -220,3 +220,50 @@ test("PowerPoint preview returns a PDF blob", async () => {
   };
   assert.equal(await (await api.preview("doc-1")).text(), "%PDF-test");
 });
+
+
+test("admin adds a subject and invalidates the subjects cache", async () => {
+  saveSession(session);
+  let reads = 0;
+  globalThis.fetch = async (url, init) => {
+    if (init.method === "POST") {
+      assert.deepEqual(JSON.parse(init.body), { code: "AI", name: "Artificial Intelligence" });
+      return Response.json({ id: 9, code: "AI", name: "Artificial Intelligence" });
+    }
+    reads++;
+    return Response.json([]);
+  };
+  await api.subjects();
+  await api.createSubject("AI", "Artificial Intelligence");
+  await api.subjects();
+  assert.equal(reads, 2);
+});
+
+
+test("note upload job preserves the explicitly selected subject", async () => {
+  saveSession(session);
+  globalThis.fetch = async (url, init) => {
+    assert.ok(url.endsWith("/notes/jobs"));
+    assert.equal(init.body.get("subject_id"), "4");
+    assert.equal(init.body.get("replace"), "false");
+    return Response.json({ id: "job" }, { status: 202 });
+  };
+  const data = new FormData();
+  data.set("subject_id", "4"); data.set("replace", "false");
+  data.set("file", new Blob(["image"], { type: "image/png" }), "note.png");
+  assert.equal((await api.startNoteJob(data)).id, "job");
+});
+
+
+test("module and subject management send authenticated requests", async () => {
+  saveSession(session);
+  const calls = [];
+  globalThis.fetch = async (url, init) => { calls.push({ url, init }); return Response.json({ id: 12, subject_id: 4, number: 6, title: "Threads" }); };
+  await api.createModule(4, 6, "Threads");
+  await api.renameModule(12, "Scheduling");
+  await api.deleteModule(12);
+  await api.deleteSubject(4);
+  assert.deepEqual(calls.map(call => call.init.method), ["POST", "PUT", "DELETE", "DELETE"]);
+  assert.ok(calls.every(call => call.init.headers.get("Authorization") === "Bearer fake-access"));
+  assert.deepEqual(JSON.parse(calls[0].init.body), { number: 6, title: "Threads" });
+});

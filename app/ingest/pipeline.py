@@ -6,7 +6,7 @@ Replace old content and insert all new rows within one database transaction.
 from pathlib import Path
 import logging
 from time import perf_counter
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pgvector import Vector
 
@@ -15,6 +15,7 @@ from app.cache import invalidate_scope
 from app.db import get_conn
 from app.embeddings import EmbeddingError, embed_documents, embedding_failure_reason, prepare_embedding_text
 from app.ingest.chunker import chunk_pages
+from app.ingest.figures import extract_figures, describe_figure
 from app.ingest.pdf_loader import load_pdf_pages
 from app.ingest.pptx_loader import NO_READABLE_SLIDES, NoReadableSlidesError, load_pptx_pages
 from app.logging_safety import log_safe_exception, safe_chunk_preview
@@ -63,7 +64,14 @@ def ingest_document(
             text = prepare_embedding_text(chunk["content"])
             if text:
                 chunks.append({**chunk, "content": text})
-        if not chunks:
+        reason = "Could not extract or describe document figures."
+        figures = extract_figures(path, file_type) if source_type == "official" else []
+        for figure in figures:
+            label = "Slide" if file_type == "pptx" else "page"
+            caption = describe_figure(figure["data"])
+            figure["content"] = prepare_embedding_text(f"[Figure on {label} {figure['page']}]: {caption}")
+            figure["id"] = uuid4()
+        if not chunks and not figures:
             hint = "PPTX needs readable slide text or speaker notes." if file_type == "pptx" else "Scanned PDFs need Phase 7 OCR."
             raise IngestError(
                 f"No usable text: pages read={page_count}, pages skipped={skipped}, "
@@ -72,8 +80,9 @@ def ingest_document(
 
         reason = "Could not generate text embeddings."
         vectors = []
-        for start in range(0, len(chunks), EMBEDDING_BATCH_SIZE):
-            batch = chunks[start:start + EMBEDDING_BATCH_SIZE]
+        all_chunks = chunks + figures
+        for start in range(0, len(all_chunks), EMBEDDING_BATCH_SIZE):
+            batch = all_chunks[start:start + EMBEDDING_BATCH_SIZE]
             vectors.extend(embed_documents([chunk["content"] for chunk in batch]))
 
         reason = "Could not save document text. Check database availability."
@@ -144,9 +153,18 @@ def ingest_document(
                             chunk["page"], chunk["chunk_index"], chunk["content"],
                             Vector(vector), settings.embedding_model,
                         )
-                        for chunk, vector in zip(chunks, vectors, strict=True)
+                        for chunk, vector in zip(chunks, vectors[:len(chunks)], strict=True)
                     ],
                 )
+
+                for index, (figure, vector) in enumerate(zip(figures, vectors[len(chunks):], strict=True)):
+                    cursor.execute("insert into course_figures (id, document_id, page, image_data) values (%s,%s,%s,%s)",
+                                   (figure["id"], document_id, figure["page"], figure["data"]))
+                    cursor.execute("""insert into chunks
+                        (document_id, subject_id, module_id, source_type, page, chunk_index, content, embedding, embedding_model, figure_id)
+                        values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (document_id, subject_id, module_id, source_type, figure["page"], len(chunks) + index,
+                         figure["content"], Vector(vector), settings.embedding_model, figure["id"]))
 
                 # Publish readiness in the same transaction as the chunks.
                 cursor.execute(
@@ -166,10 +184,10 @@ def ingest_document(
         failure_reason = error.safe_reason
         if error.chunk_index is not None:
             chunk = batch[error.chunk_index]
-            failure_reason = f"Chunk {chunk['chunk_index']}: {error.safe_reason}"
+            failure_reason = f"Chunk {chunk.get('chunk_index', 'figure')}: {error.safe_reason}"
             logging.getLogger("app.ingest").error(
                 "Embedding failed for chunk index %s; preview: %s",
-                chunk["chunk_index"], safe_chunk_preview(chunk["content"]),
+                chunk.get("chunk_index", "figure"), safe_chunk_preview(chunk["content"]),
             )
         else:
             logging.getLogger("app.ingest").error("Embedding batch failed; no individual failing chunk was reproducible.")

@@ -44,7 +44,7 @@ from fastapi.responses import JSONResponse
 from app.embeddings import get_embedder
 from app.auth import get_current_user
 from app.logging_safety import install_header_redaction
-from app.routers import ask, documents, login, me, subjects
+from app.routers import ask, documents, login, me, subjects, notes
 
 
 @asynccontextmanager
@@ -88,7 +88,7 @@ def create_app():
         allow_origins=[origin.strip() for origin in os.getenv("FRONTEND_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",") if origin.strip()],
         allow_credentials=True,
         max_age=86400,
-        allow_methods=["GET", "POST", "DELETE"],
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
         allow_headers=["Authorization", "Content-Type", "X-User-Api-Key", "X-Browser-Session"],
     )
     application.get("/health")(health)
@@ -97,6 +97,7 @@ def create_app():
     application.include_router(documents.router, dependencies=[Depends(get_current_user)])
     application.include_router(ask.router, dependencies=[Depends(get_current_user)])
     application.include_router(me.router)
+    application.include_router(notes.router)
     return application
 
 
