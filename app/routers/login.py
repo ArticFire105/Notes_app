@@ -47,6 +47,11 @@ from app.config import Settings
 router = APIRouter(prefix="/auth", tags=["login"])
 
 
+def cookie_path():
+    # The browser sees the Vercel prefix; FastAPI sees it stripped off.
+    return "/api/auth" if os.getenv("AUTH_COOKIE_PATH") == "/api/auth" else "/auth"
+
+
 class EmailRequest(BaseModel):
     email: str = Field(min_length=3, max_length=254)
 
@@ -88,7 +93,7 @@ def session_response(session, request):
         # A hosting proxy may terminate HTTPS before forwarding the request.
         secure = os.getenv("APP_ENV", "production") != "development" or request.url.scheme == "https"
         response.set_cookie("notes_refresh", session.refresh_token, max_age=30 * 24 * 60 * 60,
-                            httponly=True, secure=secure, samesite="lax", path="/auth")
+                            httponly=True, secure=secure, samesite="lax", path=cookie_path())
     return response
 
 
@@ -142,5 +147,5 @@ def logout(request: Request):
     if request.headers.get("X-Browser-Session") != "1":
         raise HTTPException(403, "Browser session header required.")
     response = JSONResponse(content={"ok": True}, headers={"Cache-Control": "no-store"})
-    response.delete_cookie("notes_refresh", path="/auth")
+    response.delete_cookie("notes_refresh", path=cookie_path(), secure=os.getenv("APP_ENV", "production") != "development" or request.url.scheme == "https", httponly=True, samesite="lax")
     return response

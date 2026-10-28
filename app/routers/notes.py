@@ -43,6 +43,7 @@ from time import monotonic
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import Response
 from pgvector import Vector
 from PIL import Image
 from psycopg.rows import dict_row
@@ -306,3 +307,25 @@ def note_file(note_id: str, user=Depends(get_current_user)):
         return {"url": personal_bucket().create_signed_url(row[0], 300)["signedURL"]}
     except Exception:
         raise HTTPException(503, "Could not open your note.") from None
+
+
+@router.get("/{note_id}/file")
+def download_note(note_id: str, user=Depends(get_current_user)):
+    from uuid import UUID
+    try:
+        note_id = UUID(note_id)
+    except ValueError:
+        raise HTTPException(404, "Note not found.") from None
+    with get_conn() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("select storage_path from personal_notes where id = %s and user_id = %s", (note_id, user["id"]))
+            row = cursor.fetchone()
+    if row is None:
+        raise HTTPException(404, "Note not found.")
+    path = row[0].lower()
+    media_type = "image/png" if path.endswith(".png") else "image/jpeg" if path.endswith((".jpg", ".jpeg")) else "application/pdf"
+    try:
+        data = personal_bucket().download(row[0])
+    except Exception:
+        raise HTTPException(503, "Could not open your note.") from None
+    return Response(data, media_type=media_type, headers={"Cache-Control": "no-store"})

@@ -122,8 +122,9 @@ export default function SubjectPage() {
 
   useEffect(() => {
     const url = viewer?.url;
-    return () => { if (url?.startsWith("blob:")) URL.revokeObjectURL(url); };
-  }, [viewer?.url]);
+    const downloadUrl = viewer?.downloadUrl;
+    return () => { if (url?.startsWith("blob:")) URL.revokeObjectURL(url); if (downloadUrl?.startsWith("blob:")) URL.revokeObjectURL(downloadUrl); };
+  }, [viewer?.url, viewer?.downloadUrl]);
 
   const selectedModule = modules.find(module => module.id === moduleId);
   const ready = (documents[moduleId || 0] || []).filter(document => document.status === "ready");
@@ -134,15 +135,11 @@ export default function SubjectPage() {
     setOpeningFile(document.id); setError("");
     try {
       if (document.file_type === "pptx") {
-        const [pdf, original] = await Promise.all([api.preview(document.id), api.fileUrl(document.id)]);
-        const originalUrl = new URL(original.url);
-        if (!["https:", "http:"].includes(originalUrl.protocol)) throw new Error("Unsupported URL");
+        const [pdf, original] = await Promise.all([api.preview(document.id), api.file(document.id)]);
         const url = URL.createObjectURL(pdf);
-        setViewer({ document, page, url, downloadUrl: original.url });
+        setViewer({ document, page, url, downloadUrl: URL.createObjectURL(original) });
       } else {
-        const { url } = await api.fileUrl(document.id);
-        const parsed = new URL(url);
-        if (!["https:", "http:"].includes(parsed.protocol)) throw new Error("Unsupported URL");
+        const url = URL.createObjectURL(await api.file(document.id));
         setViewer({ document, page, url });
       }
       setZoom(100);
@@ -153,8 +150,7 @@ export default function SubjectPage() {
   async function openSource(source: Source) {
     if (source.source_type === "personal" && source.document_id) {
       try {
-        const { url } = await api.noteFile(source.document_id);
-        if (!["http:", "https:"].includes(new URL(url).protocol)) throw new Error("Unsupported URL");
+        const url = URL.createObjectURL(await api.noteFile(source.document_id));
         setViewer({ document: { id: source.document_id, title: "My note", module: null, status: "ready", page_count: null, file_type: "pdf" }, page: source.page, url });
         setZoom(100);
       } catch (error) { setError(errorMessage(error)); }
@@ -218,7 +214,7 @@ export default function SubjectPage() {
       <div className="flex h-full w-full flex-col rounded-xl bg-white p-3 shadow-xl">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2"><h2 className="truncate font-semibold">{viewer.document.title}</h2><div className="flex items-center gap-2">
           <Button variant="outline" size="sm" onClick={() => setZoom(value => Math.max(50, value - 25))} aria-label="Zoom out">-</Button><span className="text-sm">{zoom}%</span><Button variant="outline" size="sm" onClick={() => setZoom(value => Math.min(250, value + 25))} aria-label="Zoom in">+</Button>
-          {viewer.downloadUrl && <a className="px-2 text-sm underline" href={viewer.downloadUrl} target="_blank" rel="noopener noreferrer">Download PPTX</a>}
+          {viewer.downloadUrl && <a className="px-2 text-sm underline" href={viewer.downloadUrl} download={`${viewer.document.title}.pptx`}>Download PPTX</a>}
           <Button variant="outline" size="sm" onClick={() => setViewer(null)}>Close</Button></div></div>
         <iframe title={viewer.document.title} className="w-full flex-1" src={`${viewer.url}#page=${viewer.page}&zoom=${zoom}`} />
       </div>

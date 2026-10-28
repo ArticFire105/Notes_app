@@ -382,6 +382,16 @@ def document_pdf_url(document_id: UUID):
     return {"url": signed_url(document["storage_path"])}
 
 
+@router.get("/documents/{document_id}/file")
+def document_file(document_id: UUID):
+    document = get_document(document_id)
+    path = document.get("storage_path")
+    if not path:
+        raise HTTPException(404, "This document has no stored file.")
+    media_type = PPTX_CONTENT_TYPE if path.lower().endswith(".pptx") else "application/pdf"
+    return Response(download_document(path), media_type=media_type, headers={"Cache-Control": "no-store"})
+
+
 
 @router.get("/documents/{document_id}/slides/{number}")
 def document_slide(document_id: UUID, number: int):
