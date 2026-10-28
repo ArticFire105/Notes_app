@@ -37,7 +37,7 @@ Use uv run pytest for the offline test suite.
 from fastapi import APIRouter, Depends, HTTPException
 
 from app import cache, quota
-from app.auth import get_current_user
+from app.auth import get_current_user, check_rate_limit
 from app.db import get_conn
 from app.llm import user_api_key
 from app.rag.answer import answer_question, answer_small_talk, is_small_talk
@@ -74,6 +74,7 @@ def check_scope(request: AskRequest):
 
 @router.post("/ask", response_model=AskResponse)
 def ask(request: AskRequest, user=Depends(get_current_user), api_key=Depends(user_api_key)):
+    check_rate_limit(user["id"], "chat")
     # Validate → cache → BYOK or reserve quota → retrieve → answer → usage → cache → remaining.
     check_scope(request)
     small_talk = is_small_talk(request.question)

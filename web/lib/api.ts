@@ -147,6 +147,9 @@ async function request<T>(path: string, init: RequestInit = {}, authenticated = 
   }
   if (authenticated && startedRevision !== revision) throw new ApiError("Your session changed. Please try again.");
   if (!response.ok) {
+    if (response.status === 429 && response.headers.has("Retry-After")) {
+      throw new ApiError("Too many requests. Please wait and try again.", 429);
+    }
     const messages: Record<number, string> = {
       400: "Check your input and try again. For email codes, you may need to wait before resending.",
       401: "Your session or email code has expired. Please sign in again.",
@@ -188,6 +191,9 @@ async function request<T>(path: string, init: RequestInit = {}, authenticated = 
       if (body?.detail === "No readable text found in slides") {
         throw new ApiError("No readable text found in slides", 400);
       }
+    }
+    if (path === "/documents" && response.status === 413) {
+      throw new ApiError("Choose a file of at most 40 MB and 200 pages or slides.", 413);
     }
     // Provider response bodies can contain diagnostics; display only fixed messages.
     throw new ApiError(messages[response.status] || "The backend could not complete this request.", response.status);

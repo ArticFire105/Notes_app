@@ -57,7 +57,8 @@ from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 from app.cache import invalidate_scope
-from app.auth import require_role
+from app import heartbeats
+from app.auth import require_role, check_rate_limit
 from app.ingest.pipeline import IngestError, ingest_document
 from app.ingest.pptx_loader import NO_READABLE_SLIDES, NoReadableSlidesError, load_pptx_pages
 from app.logging_safety import log_safe_exception
@@ -72,6 +73,7 @@ _queue_items = {}
 _queue_lock = Lock()
 _worker_started = False
 MAX_UPLOAD_BYTES = 40 * 1024 * 1024
+MAX_UPLOAD_PAGES = 200
 PPTX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 DELETE_FAILED = "Could not complete document deletion. Please retry or check backend logs."
 DELETE_RECOVERY_FAILED = "Delete failed and the file could not be restored. Contact the administrator and check backend logs."
@@ -145,12 +147,14 @@ def _process_queue():
             with _queue_lock:
                 _queue_items[document_id].update(status="failed", queue_status="failed", error="Could not process this file. Please retry.")
         finally:
+            heartbeats.unregister("document", document_id)
             _queue.task_done()
 
 
 def enqueue_document(document, job):
     global _worker_started
     document_id = job[1]
+    heartbeats.register("document", document_id)
     with _queue_lock:
         _queue_items[document_id] = {**document, "queue_status": "queued"}
         _queue.put(job)
@@ -161,44 +165,44 @@ def enqueue_document(document, job):
 
 @router.get("/admin/upload-queue")
 def upload_queue(user=Depends(require_role("admin"))):
+    with get_conn() as connection:
+        with connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute("select " + DOCUMENT_COLUMNS + """ from documents d
+                left join modules m on m.id=d.module_id
+                where d.source_type='official' and d.status in ('processing','failed')
+                order by d.created_at desc""")
+            stored = cursor.fetchall()
     with _queue_lock:
-        items = [dict(item) for item in _queue_items.values()]
+        items = {str(row["id"]): {**row, "queue_status": "failed" if row["status"] == "failed" else "indexing"} for row in stored}
+        for item in _queue_items.values():
+            items[str(item["id"])] = dict(item)
     with _progress_lock:
-        for item in items:
+        for item in items.values():
             item.update(_progress.get(item["id"], {}))
-    return items
+    return list(items.values())
 
 
 @router.post("/admin/upload-queue/{document_id}/retry", status_code=202)
 def retry_upload(document_id: UUID, user=Depends(require_role("admin"))):
-    with _queue_lock:
-        item = _queue_items.get(document_id)
-        if not item or item["queue_status"] != "failed":
-            raise HTTPException(409, "Only a failed upload can be retried.")
-        item["queue_status"] = "queued"
-    try:
-        with get_conn() as connection:
-            with connection.cursor(row_factory=dict_row) as cursor:
-                cursor.execute("""select d.title, d.storage_path, s.code, m.number
-                    from documents d join subjects s on s.id = d.subject_id
-                    join modules m on m.id = d.module_id
-                    where d.id = %s and d.status = 'failed' and d.source_type = 'official'""", (document_id,))
-                row = cursor.fetchone()
-                if not row or not row["storage_path"]:
-                    raise HTTPException(404, "The uploaded file is no longer available.")
-                data = download_document(row["storage_path"])
-                cursor.execute("update documents set status = 'processing', error = null where id = %s and status = 'failed'", (document_id,))
-                if cursor.rowcount != 1:
-                    raise HTTPException(409, "This upload is no longer failed.")
-        file_type = "pptx" if row["storage_path"].lower().endswith(".pptx") else "pdf"
-        with _queue_lock:
-            item.update(status="processing", error=None)
-            _queue.put((data, document_id, row["code"], row["number"], row["title"], file_type))
-        return {"queued": True}
-    except Exception:
-        with _queue_lock:
-            item["queue_status"] = "failed"
-        raise
+    check_rate_limit(user["id"], "upload")
+    with get_conn() as connection:
+        with connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute("""select d.id, d.title, d.storage_path, s.code, m.number
+                from documents d join subjects s on s.id = d.subject_id
+                join modules m on m.id = d.module_id
+                where d.id = %s and d.status = 'failed' and d.source_type = 'official'""", (document_id,))
+            row = cursor.fetchone()
+            if not row or not row["storage_path"]:
+                raise HTTPException(404, "The uploaded file is no longer available.")
+            data = download_document(row["storage_path"])
+            cursor.execute("update documents set status = 'processing', error = null, job_heartbeat_at = now() where id = %s and status = 'failed'", (document_id,))
+            if cursor.rowcount != 1:
+                raise HTTPException(409, "This upload is no longer failed.")
+    file_type = "pptx" if row["storage_path"].lower().endswith(".pptx") else "pdf"
+    item = {"id": document_id, "title": row["title"], "module": row["number"],
+            "status": "processing", "error": None, "file_type": file_type}
+    enqueue_document(item, (data, document_id, row["code"], row["number"], row["title"], file_type))
+    return {"queued": True}
 
 @router.get("/modules/{module_id}/documents", response_model=list[DocumentOut])
 def list_documents(module_id: int):
@@ -227,6 +231,7 @@ async def create_document(
     title: str = Form(min_length=1, max_length=500),
     user=Depends(require_role("admin")),
 ):
+    check_rate_limit(user["id"], "upload")
     title = title.strip()
     if not title:
         raise HTTPException(400, "Provide a nonempty document title.")
@@ -261,16 +266,20 @@ def queue_document(background_tasks, file_bytes, subject_id, module_id, title, u
             pages, skipped = load_pptx_pages(file_bytes)
             if not pages and not skipped:
                 raise ValueError("Empty presentation")
+            page_count = len(pages) + skipped
         else:
             reader = PdfReader(BytesIO(file_bytes))
             if reader.is_encrypted or len(reader.pages) == 0:
                 raise ValueError("Unreadable PDF")
+            page_count = len(reader.pages)
     except NoReadableSlidesError as error:
         log_safe_exception(error, NO_READABLE_SLIDES)
         raise HTTPException(400, NO_READABLE_SLIDES) from None
     except Exception as error:
         log_safe_exception(error, "Could not read uploaded document.")
         raise HTTPException(400, "Upload a readable, unencrypted PDF or .pptx presentation with slides.") from None
+    if page_count > MAX_UPLOAD_PAGES:
+        raise HTTPException(413, "Files must have at most 200 pages or slides.")
     with get_conn() as connection:
         with connection.cursor(row_factory=dict_row) as cursor:
             cursor.execute("select code from subjects where id = %s", (subject_id,))

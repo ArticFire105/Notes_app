@@ -186,3 +186,19 @@ def test_otp_helper_failed_login_does_not_print_token(backend, monkeypatch, caps
     output = capsys.readouterr().out
     assert "Login check failed" in output
     assert "fake-private-token" not in output
+
+
+def test_rate_limit_is_per_user_and_category(monkeypatch):
+    from app import auth
+    monkeypatch.setitem(auth.RATE_LIMITS, "chat", (2, 60))
+    monkeypatch.setattr(auth, "monotonic", lambda: 100.0)
+    auth.check_rate_limit("one", "chat")
+    auth.check_rate_limit("one", "chat")
+    with pytest.raises(auth.HTTPException) as error:
+        auth.check_rate_limit("one", "chat")
+    assert error.value.status_code == 429
+    assert error.value.headers["Retry-After"] == "61"
+    auth.check_rate_limit("two", "chat")
+    auth.check_rate_limit("one", "upload")
+    monkeypatch.setattr(auth, "monotonic", lambda: 161.0)
+    auth.check_rate_limit("one", "chat")

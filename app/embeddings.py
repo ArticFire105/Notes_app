@@ -25,12 +25,6 @@ MEDIA_REFERENCE = re.compile(
 )
 
 
-def HuggingFaceEmbeddings(**kwargs):
-    # Loading the local libraries at import would slow down Gemini-only servers.
-    from langchain_huggingface import HuggingFaceEmbeddings as LocalEmbeddings
-    return LocalEmbeddings(**kwargs)
-
-
 class EmbeddingError(RuntimeError):
     """A failed text embedding with a safe reason and optional batch position."""
 
@@ -125,37 +119,7 @@ class GeminiEmbedder:
 @cache
 def get_embedder():
     settings = Settings()
-    if settings.embedding_provider == "gemini":
-        return GeminiEmbedder(settings)
-
-    with _quiet_model_output():
-        import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        # Keep CPU work from oversubscribing small hosts.
-        if device == "cpu":
-            torch.set_num_threads(min(4, os.cpu_count() or 1))
-        embedder = HuggingFaceEmbeddings(
-            model_name=settings.embedding_model,
-            model_kwargs={
-                "device": device,
-                "token": settings.hf_token.get_secret_value(),
-                "config_kwargs": {"vision_config": None, "audio_config": None},
-            },
-            # https://huggingface.co/google/embeddinggemma-2#quick-start
-            encode_kwargs={"prompt_name": "Document", "normalize_embeddings": True},
-            query_encode_kwargs={"prompt_name": "SearchQuery", "normalize_embeddings": True},
-        )
-        transformer = embedder._client[0]
-        if "text" not in transformer.modality_config:
-            raise ValueError("The embedding model must support text input.")
-        # Disable media inference without changing the text/chat prompt formatting used by existing PDFs.
-        transformer.modality_config = {
-            name: config for name, config in transformer.modality_config.items()
-            if name in {"text", "message"}
-        }
-        transformer.input_formatter.supported_modalities = ["text"]
-    logging.getLogger(__name__).info("Embedding device: %s", device)
-    return embedder
+    return GeminiEmbedder(settings)
 
 
 def embed_documents(texts: list[str]) -> list[list[float]]:

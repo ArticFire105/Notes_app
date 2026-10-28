@@ -164,7 +164,7 @@ def auth_backend(monkeypatch):
     settings = SimpleNamespace(allowed_email_domain="dxb.manipal.edu")
     monkeypatch.setattr(login, "login_client", lambda: (settings, provider))
     monkeypatch.setattr(main, "get_embedder", lambda: None)
-    with TestClient(main.create_app()) as client:
+    with TestClient(main.create_app(), base_url="https://testserver") as client:
         yield client, provider
 
 
@@ -207,15 +207,15 @@ def test_backend_accepts_six_to_eight_digit_codes(auth_backend, code):
     )
 
 
-def test_browser_cors_allows_local_frontend(auth_backend):
+def test_browser_cors_rejects_local_frontend_by_default_in_production(auth_backend):
     client, provider = auth_backend
     response = client.options("/ask", headers={
         "Origin": "http://localhost:3000",
         "Access-Control-Request-Method": "POST",
         "Access-Control-Request-Headers": "authorization,content-type,x-user-api-key",
     })
-    assert response.status_code == 200
-    assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
+    assert response.status_code == 400
+    assert "access-control-allow-origin" not in response.headers
 
 
 def test_browser_cors_rejects_other_origins(auth_backend):
@@ -411,6 +411,8 @@ def test_browser_cookie_session_rotation_and_logout(auth_backend):
     assert "refresh_token" not in verified.json()
     assert "HttpOnly" in verified.headers["set-cookie"]
     assert "SameSite=lax" in verified.headers["set-cookie"]
+    assert "Secure" in verified.headers["set-cookie"]
+    assert "Domain=" not in verified.headers["set-cookie"]
     refreshed = client.post("/auth/refresh", headers=headers)
     assert refreshed.status_code == 200
     assert "refresh_token" not in refreshed.json()

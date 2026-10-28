@@ -36,6 +36,7 @@ Use uv run pytest for the offline test suite.
 
 from contextlib import asynccontextmanager
 import os
+from threading import Event, Thread
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,8 +44,38 @@ from fastapi.responses import JSONResponse
 
 from app.embeddings import get_embedder
 from app.auth import get_current_user
+from app.db import get_conn
+from app import heartbeats
 from app.logging_safety import install_header_redaction
 from app.routers import ask, documents, login, me, subjects, notes, worksheets
+
+
+def recover_interrupted_jobs():
+    # The queue and worksheet workers live only in the previous process.
+    with get_conn() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""update documents set status='failed', error=%s
+                where source_type='official' and status='processing'
+                and job_heartbeat_at < now() - interval '5 minutes'""",
+                ("Processing was interrupted by a server restart. Please retry.",))
+            cursor.execute("""update worksheet_questions set status='failed', error=%s
+                where status in ('queued', 'answering')
+                and job_heartbeat_at < now() - interval '5 minutes'""",
+                ("Processing was interrupted by a server restart. Please retry.",))
+            cursor.execute("""update worksheets set status='failed', error=%s
+                where status in ('extracting', 'answering')
+                and job_heartbeat_at < now() - interval '5 minutes'""",
+                ("Processing was interrupted by a server restart. Retry a question, or upload the worksheet again.",))
+
+
+def maintain_jobs(stop):
+    while not stop.wait(30):
+        try:
+            heartbeats.refresh()
+            recover_interrupted_jobs()
+        except Exception:
+            # Driver exceptions can contain connection credentials.
+            pass
 
 
 @asynccontextmanager
@@ -52,9 +83,17 @@ async def lifespan(app: FastAPI):
     try:
         # Startup warming avoids loading the same expensive model per request.
         get_embedder()
+        recover_interrupted_jobs()
     except Exception:
-        raise RuntimeError("Embedding model startup failed; check local setup.") from None
-    yield
+        raise RuntimeError("Backend startup failed; check backend configuration and database.") from None
+    stop = Event()
+    worker = Thread(target=maintain_jobs, args=(stop,), daemon=True)
+    worker.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        worker.join(timeout=1)
 
 
 install_header_redaction()
@@ -85,7 +124,10 @@ def create_app():
     application.middleware("http")(safe_errors)
     application.add_middleware(
         CORSMiddleware,
-        allow_origins=[origin.strip() for origin in os.getenv("FRONTEND_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",") if origin.strip()],
+        allow_origins=[origin.strip() for origin in os.getenv(
+            "FRONTEND_ORIGINS",
+            "http://localhost:3000,http://127.0.0.1:3000" if development else "",
+        ).split(",") if origin.strip() and origin.strip() != "*"],
         allow_credentials=True,
         max_age=86400,
         allow_methods=["GET", "POST", "PUT", "DELETE"],

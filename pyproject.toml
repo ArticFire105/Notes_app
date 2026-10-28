@@ -20,12 +20,9 @@ dependencies = [
     "pypdf",
     "python-pptx",
     "langchain-text-splitters",
-    "langchain-huggingface",
-    "sentence-transformers",
     "langchain",
     "langchain-google-genai",
     "pillow>=13.0.0",
-    "torchvision>=0.29.1",
 ]
 
 [dependency-groups]

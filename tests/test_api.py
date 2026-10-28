@@ -50,6 +50,7 @@ from pptx import Presentation
 import pytest
 
 from app import config, db, embeddings, llm, main, storage
+from app.main import recover_interrupted_jobs as run_recovery
 from app.auth import get_current_user
 from app.routers import ask, documents, subjects
 
@@ -64,7 +65,7 @@ def no_external_services(monkeypatch):
     # Fail immediately if a test accidentally reaches dotenv or a real client.
     monkeypatch.setattr(config.Settings, "__init__", forbidden)
     monkeypatch.setattr(db.psycopg, "connect", forbidden)
-    monkeypatch.setattr(embeddings, "HuggingFaceEmbeddings", forbidden)
+    monkeypatch.setattr(embeddings, "GeminiEmbedder", forbidden)
     monkeypatch.setattr(llm, "init_chat_model", forbidden)
     monkeypatch.setattr(storage, "create_client", forbidden)
 
@@ -291,6 +292,14 @@ def test_size_limit_and_blank_title(client, backend, pdf, monkeypatch):
     monkeypatch.setattr(documents, "MAX_UPLOAD_BYTES", len(pdf) - 1)
     assert post_pdf(client, pdf).status_code == 413
     assert post_pdf(client, pdf, title=" ").status_code == 400
+    backend.upload.assert_not_called()
+
+
+def test_upload_page_limit_before_storage(client, backend, pdf, monkeypatch):
+    monkeypatch.setattr(documents, "MAX_UPLOAD_PAGES", 0)
+    response = post_pdf(client, pdf)
+    assert response.status_code == 413
+    assert "pages or slides" in response.json()["detail"]
     backend.upload.assert_not_called()
 
 
@@ -627,8 +636,8 @@ def test_browser_cors_allows_delete(client):
         "Origin": "http://localhost:3000", "Access-Control-Request-Method": "DELETE",
         "Access-Control-Request-Headers": "authorization",
     })
-    assert response.status_code == 200
-    assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
+    assert response.status_code == 400
+    assert "access-control-allow-origin" not in response.headers
 
 
 def test_storage_backup_and_restore_helpers_use_private_bucket(monkeypatch):
@@ -656,6 +665,29 @@ def test_subject_overview_returns_documents_and_usage(client, backend, monkeypat
 def test_cors_preflight_is_cached(client):
     result = client.options("/ask", headers={"Origin": "http://localhost:3000", "Access-Control-Request-Method": "POST"})
     assert result.headers["access-control-max-age"] == "86400"
+
+
+def test_production_cors_allows_only_configured_origin(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("FRONTEND_ORIGINS", "https://example.vercel.app,*")
+    monkeypatch.setattr(main, "get_embedder", lambda: None)
+    with TestClient(main.create_app()) as client:
+        headers = {"Access-Control-Request-Method": "POST"}
+        allowed = client.options("/ask", headers={**headers, "Origin": "https://example.vercel.app"})
+        rejected = client.options("/ask", headers={**headers, "Origin": "https://other.example"})
+        assert allowed.headers["access-control-allow-origin"] == "https://example.vercel.app"
+        assert "access-control-allow-origin" not in rejected.headers
+
+
+def test_chat_rate_limit_returns_retry_after(client, backend, monkeypatch):
+    from app import auth
+    monkeypatch.setitem(auth.RATE_LIMITS, "chat", (1, 60))
+    payload = {"question": "Explain it", "subject_id": 1}
+    backend.cursor.fetchone.return_value = (1,)
+    assert client.post("/ask", json=payload).status_code == 200
+    response = client.post("/ask", json=payload)
+    assert response.status_code == 429
+    assert int(response.headers["retry-after"]) > 0
 
 
 def test_followup_bypasses_shared_cache(client, backend, monkeypatch):
@@ -975,15 +1007,85 @@ def test_retry_failed_upload_requeues_stored_file(monkeypatch):
     cursor = context.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
     cursor.fetchone.return_value = {"title": "Lecture", "storage_path": "official/test.pdf", "code": "OS", "number": 2}
     cursor.rowcount = 1
-    queue = Queue()
-    item = {"id": DOCUMENT_ID, "queue_status": "failed", "status": "failed", "error": "failed"}
-    monkeypatch.setattr(documents, "_queue_items", {DOCUMENT_ID: item})
-    monkeypatch.setattr(documents, "_queue", queue)
+    enqueue = MagicMock()
+    monkeypatch.setattr(documents, "enqueue_document", enqueue)
     monkeypatch.setattr(documents, "get_conn", context)
     monkeypatch.setattr(documents, "download_document", lambda path: b"stored")
-    assert documents.retry_upload(DOCUMENT_ID, {"role": "admin"}) == {"queued": True}
-    assert queue.get_nowait() == (b"stored", DOCUMENT_ID, "OS", 2, "Lecture", "pdf")
-    assert item["queue_status"] == "queued" and item["error"] is None
+    assert documents.retry_upload(DOCUMENT_ID, {"role": "admin", "id": DOCUMENT_ID}) == {"queued": True}
+    assert enqueue.call_args.args[1] == (b"stored", DOCUMENT_ID, "OS", 2, "Lecture", "pdf")
+    assert enqueue.call_args.args[0]["status"] == "processing"
+
+
+def test_upload_queue_shows_failed_database_job_after_restart(monkeypatch):
+    context = MagicMock()
+    cursor = context.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
+    cursor.fetchall.return_value = [{"id": DOCUMENT_ID, "title": "Lecture", "status": "failed", "error": "Please retry."}]
+    monkeypatch.setattr(documents, "get_conn", context)
+    monkeypatch.setattr(documents, "_queue_items", {})
+    result = documents.upload_queue({"id": DOCUMENT_ID, "role": "admin"})
+    assert result[0]["queue_status"] == "failed"
+    assert result[0]["error"] == "Please retry."
+
+
+def test_recovery_marks_interrupted_work_but_preserves_completed_work(monkeypatch):
+    database = sqlite3.connect(":memory:")
+    database.executescript("""
+        create table documents (source_type text, status text, error text, job_heartbeat_at text);
+        create table worksheets (status text, error text, job_heartbeat_at text);
+        create table worksheet_questions (status text, error text, job_heartbeat_at text);
+        insert into documents values ('official', 'processing', null, '2000-01-01'), ('official', 'ready', null, '2000-01-01'), ('official', 'processing', null, datetime('now'));
+        insert into worksheets values ('extracting', null, '2000-01-01'), ('answering', null, '2000-01-01'), ('ready', null, '2000-01-01'), ('answering', null, datetime('now'));
+        insert into worksheet_questions values ('queued', null, '2000-01-01'), ('answering', null, '2000-01-01'), ('ready', null, '2000-01-01'), ('answering', null, datetime('now'));
+    """)
+    class Cursor:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def execute(self, sql, values):
+            sql = sql.replace("%s", "?").replace("now() - interval '5 minutes'", "datetime('now', '-5 minutes')")
+            database.execute(sql, values)
+    class Connection:
+        def cursor(self): return Cursor()
+    @contextmanager
+    def connection():
+        yield Connection()
+        database.commit()
+    monkeypatch.setattr(main, "get_conn", connection)
+    run_recovery()
+    assert database.execute("select status from documents order by rowid").fetchall() == [("failed",), ("ready",), ("processing",)]
+    assert database.execute("select status from worksheets order by rowid").fetchall() == [("failed",), ("failed",), ("ready",), ("answering",)]
+    assert database.execute("select status from worksheet_questions order by rowid").fetchall() == [("failed",), ("failed",), ("ready",), ("answering",)]
+    assert "retry" in database.execute("select error from documents where status='failed'").fetchone()[0].lower()
+
+
+def test_startup_calls_recovery(monkeypatch):
+    recovery = MagicMock()
+    monkeypatch.setattr(main, "get_embedder", lambda: None)
+    monkeypatch.setattr(main, "recover_interrupted_jobs", recovery)
+    with TestClient(main.create_app()) as client:
+        assert client.get("/health").status_code == 200
+    recovery.assert_called_once()
+
+
+def test_heartbeat_refresh_tracks_live_jobs(monkeypatch):
+    from app import heartbeats
+    context = MagicMock()
+    cursor = context.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
+    monkeypatch.setattr(heartbeats, "get_conn", context)
+    monkeypatch.setattr(heartbeats, "_active", {"document": {}, "worksheet": {}})
+    heartbeats.register("document", DOCUMENT_ID)
+    heartbeats.register("worksheet", DOCUMENT_ID)
+    heartbeats.register("worksheet", DOCUMENT_ID)
+    heartbeats.unregister("worksheet", DOCUMENT_ID)
+    heartbeats.refresh()
+    sql = [call.args[0] for call in cursor.execute.call_args_list]
+    assert any("update documents set job_heartbeat_at" in query for query in sql)
+    assert any("update worksheets set job_heartbeat_at" in query for query in sql)
+    assert any("update worksheet_questions set job_heartbeat_at" in query for query in sql)
+    heartbeats.unregister("document", DOCUMENT_ID)
+    heartbeats.unregister("worksheet", DOCUMENT_ID)
+    cursor.reset_mock()
+    heartbeats.refresh()
+    cursor.execute.assert_not_called()
 
 
 def test_worksheet_extraction_preserves_unknown_fields(monkeypatch):

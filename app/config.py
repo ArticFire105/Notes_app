@@ -55,9 +55,7 @@ class Settings(BaseSettings):
     supabase_anon_key: SecretStr
     supabase_service_role_key: SecretStr
     google_api_key: SecretStr
-    hf_token: SecretStr = SecretStr("")
-
-    embedding_provider: Literal["local", "gemini"] = "gemini"
+    embedding_provider: Literal["gemini"] = "gemini"
     embedding_model: str = "gemini-embedding-2"
     embedding_dim: int = 768
     chat_model: str = "google_genai:gemini-3.5-flash-lite"
@@ -66,7 +64,7 @@ class Settings(BaseSettings):
     allowed_email_domain: str = "dxb.manipal.edu"
     questions_per_day: int = Field(default=5, gt=0)
     max_context_tokens: int = Field(default=4000, gt=0)
-    global_daily_cap: int = Field(default=100, gt=0)
+    global_daily_cap: int = Field(default=250, gt=0)
     global_daily_budget_usd: Decimal | None = Field(default=None, gt=0)
     price_input_per_1m_usd: Decimal = Field(default=Decimal("0"), ge=0)
     price_output_per_1m_usd: Decimal = Field(default=Decimal("0"), ge=0)

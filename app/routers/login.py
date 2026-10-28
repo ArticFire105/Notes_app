@@ -34,6 +34,8 @@ Run uv run pytest from the repository root.
 Start FastAPI before starting Streamlit.
 """
 
+import os
+
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, SecretStr
@@ -83,9 +85,10 @@ def session_response(session, request):
         content["refresh_token"] = session.refresh_token
     response = JSONResponse(content=content, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
     if browser:
-        secure = request.url.scheme == "https"
+        # A hosting proxy may terminate HTTPS before forwarding the request.
+        secure = os.getenv("APP_ENV", "production") != "development" or request.url.scheme == "https"
         response.set_cookie("notes_refresh", session.refresh_token, max_age=30 * 24 * 60 * 60,
-                            httponly=True, secure=secure, samesite="none" if secure else "lax", path="/auth")
+                            httponly=True, secure=secure, samesite="lax", path="/auth")
     return response
 
 

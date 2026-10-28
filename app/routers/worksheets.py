@@ -54,7 +54,8 @@ from pypdf import PdfReader
 from pydantic import BaseModel, Field
 
 from app import quota
-from app.auth import get_current_user
+from app import heartbeats
+from app.auth import get_current_user, check_rate_limit
 from app.config import Settings
 from app.db import get_conn
 from app.llm import user_api_key, get_chat_model, provider_errors
@@ -274,8 +275,16 @@ def run_worksheet(worksheet_id, user_id, files, api_key=None, answer_method="all
                 cursor.execute("update worksheets set status='failed', error=%s where id=%s and owner_id=%s", ("Could not read this worksheet. Please upload it again.", worksheet_id, user_id))
 
 
+def run_tracked_worksheet(function, worksheet_id, *args):
+    try:
+        function(worksheet_id, *args)
+    finally:
+        heartbeats.unregister("worksheet", worksheet_id)
+
+
 @router.post("", status_code=202)
 async def upload_worksheet(background_tasks: BackgroundTasks, subject_id: int = Form(gt=0), mode: str = Form(), answer_method: str = Form(default="all"), files: list[UploadFile] = File(), user=Depends(get_current_user), api_key=Depends(user_api_key)):
+    check_rate_limit(user["id"], "upload")
     if mode not in {"normal", "strict"} or answer_method not in {"all", "one"} or not 1 <= len(files) <= 30:
         raise HTTPException(400, "Choose an answer mode and 1 to 30 files.")
     prepared = []
@@ -300,7 +309,8 @@ async def upload_worksheet(background_tasks: BackgroundTasks, subject_id: int = 
             if cursor.fetchone() is None:
                 raise HTTPException(404, "Subject not found.")
             cursor.execute("insert into worksheets (id,owner_id,subject_id,mode,status) values (%s,%s,%s,%s,'extracting')", (worksheet_id, user["id"], subject_id, mode))
-    background_tasks.add_task(run_worksheet, worksheet_id, user["id"], prepared, api_key, answer_method)
+    heartbeats.register("worksheet", worksheet_id)
+    background_tasks.add_task(run_tracked_worksheet, run_worksheet, worksheet_id, user["id"], prepared, api_key, answer_method)
     return {"id": str(worksheet_id)}
 
 
@@ -334,13 +344,17 @@ def retry_question_job(worksheet_id, question_id, user_id, api_key):
 
 @router.post("/{worksheet_id}/questions/{question_id}/retry", status_code=202)
 def retry_question(worksheet_id: UUID, question_id: int, background_tasks: BackgroundTasks, user=Depends(get_current_user), api_key=Depends(user_api_key)):
+    check_rate_limit(user["id"], "worksheet")
     with get_conn() as connection:
         with connection.cursor() as cursor:
-            cursor.execute("""update worksheet_questions q set status='queued', error=null from worksheets w
+            cursor.execute("""update worksheet_questions q set status='queued', error=null, job_heartbeat_at=now() from worksheets w
                 where q.id=%s and q.worksheet_id=w.id and w.id=%s and w.owner_id=%s and q.status in ('failed', 'queued') returning q.id""", (question_id, worksheet_id, user["id"]))
             if cursor.fetchone() is None:
                 raise HTTPException(404, "Failed question not found.")
-    background_tasks.add_task(retry_question_job, worksheet_id, question_id, user["id"], api_key)
+            cursor.execute("""update worksheets set status='ready', error=null
+                where id=%s and owner_id=%s and status='failed'""", (worksheet_id, user["id"]))
+    heartbeats.register("worksheet", worksheet_id)
+    background_tasks.add_task(run_tracked_worksheet, retry_question_job, worksheet_id, question_id, user["id"], api_key)
     return {"queued": True}
 
 
@@ -362,12 +376,15 @@ def answer_remaining(worksheet_id, user_id, api_key):
 
 @router.post("/{worksheet_id}/answer-all", status_code=202)
 def start_answers(worksheet_id: UUID, background_tasks: BackgroundTasks, user=Depends(get_current_user), api_key=Depends(user_api_key)):
+    check_rate_limit(user["id"], "worksheet")
     with get_conn() as connection:
         with connection.cursor() as cursor:
-            cursor.execute("update worksheets set error=null where id=%s and owner_id=%s and status='ready' returning id", (worksheet_id, user["id"]))
+            cursor.execute("update worksheets set error=null, job_heartbeat_at=now() where id=%s and owner_id=%s and status='ready' returning id", (worksheet_id, user["id"]))
             if cursor.fetchone() is None:
                 raise HTTPException(404, "Worksheet not found or still being read.")
-    background_tasks.add_task(answer_remaining, worksheet_id, user["id"], api_key)
+            cursor.execute("update worksheet_questions set job_heartbeat_at=now() where worksheet_id=%s and status='queued'", (worksheet_id,))
+    heartbeats.register("worksheet", worksheet_id)
+    background_tasks.add_task(run_tracked_worksheet, answer_remaining, worksheet_id, user["id"], api_key)
     return {"queued": True}
 
 
@@ -436,6 +453,7 @@ def chat_answer(rows, history, subject_id, mode, message, user_id, api_key):
 
 @router.post("/{worksheet_id}/ask")
 def worksheet_followup(worksheet_id: UUID, request: WorksheetFollowup, user=Depends(get_current_user), api_key=Depends(user_api_key)):
+    check_rate_limit(user["id"], "chat")
     with get_conn() as connection:
         with connection.cursor(row_factory=dict_row) as cursor:
             cursor.execute("select subject_id, mode from worksheets where id=%s and owner_id=%s", (worksheet_id, user["id"]))

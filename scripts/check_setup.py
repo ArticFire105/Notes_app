@@ -85,7 +85,7 @@ def check_database(settings: Settings) -> bool:
 
 
 def check_embedding(settings: Settings) -> bool:
-    print("Checking local embeddings (the first run may download model weights)...")
+    print("Checking Gemini embeddings...")
     previous_logging_level = logging.root.manager.disable
     try:
         # Third-party download errors can include authenticated URLs. Keep their
@@ -93,18 +93,11 @@ def check_embedding(settings: Settings) -> bool:
         with open(os.devnull, "w") as quiet:
             with redirect_stdout(quiet), redirect_stderr(quiet):
                 logging.disable(logging.CRITICAL)
-                from sentence_transformers import SentenceTransformer
-
-                model = SentenceTransformer(
-                    settings.embedding_model,
-                    token=settings.hf_token.get_secret_value(),
-                )
-                vector = model.encode(
-                    "Lecture notes setup check.", show_progress_bar=False
-                )
+                from app.embeddings import GeminiEmbedder
+                vector = GeminiEmbedder(settings).embed_query("Lecture notes setup check.")
                 dimension = len(vector)
     except Exception:
-        print("FAIL embeddings: check model access, HF_TOKEN, downloads, and local memory.")
+        print("FAIL embeddings: check the Gemini model and backend configuration.")
         return False
     finally:
         logging.disable(previous_logging_level)

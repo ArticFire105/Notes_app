@@ -48,7 +48,7 @@ from PIL import Image
 from psycopg.rows import dict_row
 from pypdf import PdfReader
 
-from app.auth import get_current_user
+from app.auth import get_current_user, check_rate_limit
 from app.config import Settings
 from app.db import get_conn
 from app.embeddings import embed_documents
@@ -217,6 +217,7 @@ def run_job(job_id, data, filename, subject_id, replace, user_id, api_key=None):
 async def start_job(background_tasks: BackgroundTasks, file: UploadFile = File(),
                     subject_id: int = Form(gt=0), replace: bool = Form(default=False),
                     user=Depends(get_current_user), api_key=Depends(user_api_key)):
+    check_rate_limit(user["id"], "upload")
     try:
         data = await file.read(MAX_BYTES + 1)
     finally:
@@ -246,6 +247,7 @@ def job_status(job_id: str, user=Depends(get_current_user)):
 @router.post("")
 async def upload_note(file: UploadFile = File(), subject_id: int = Form(gt=0),
                       replace: bool = Form(default=False), user=Depends(get_current_user), api_key=Depends(user_api_key)):
+    check_rate_limit(user["id"], "upload")
     try:
         data = await file.read(MAX_BYTES + 1)
     finally:
