@@ -381,3 +381,31 @@ FastAPI remains responsible for domain validation, roles, quota, and retrieval.
 Offline tests mock HTTP and Supabase, exercise Streamlit screens, and make no
 live email, database, Storage, model-download, or Gemini calls. Live email
 delivery, signed PDF links, ingestion, and answer quality must be tested by hand.
+# Handwriting OCR
+
+### Start on Windows
+
+Double-click `Start Notes App.cmd` in the project folder. Separate windows show
+the backend and frontend logs; the frontend builds before it starts.
+Keep the controller window open and press Enter in it to stop all the services
+it started. If a service fails, its window stays open so you can see the error.
+After the frontend build finishes, open `http://localhost:3000` in your browser.
+
+Install uv, Node.js, the project dependencies (`uv sync` and `npm ci` in
+`web`). Handwritten uploads are sent to Google Gemini for OCR. Configure
+`OCR_MODEL` separately from `CHAT_MODEL` if you need a different OCR model.
+
+The controller cannot clean up if it is forcibly closed; in that case, close
+each remaining service window manually. If a port is already occupied, inspect
+the relevant log window and stop the existing service before retrying.
+
+Compare Gemini's transcription on a sample stored outside the repository, optionally with
+a hand-typed reference. The output prefix must also be outside the repository;
+the script refuses to overwrite existing output files.
+
+```powershell
+uv run python -m scripts.compare_ocr C:\private\sample.png C:\private\comparison --reference C:\private\reference.txt
+```
+
+Review the transcript and word error rate. OCR can misread or invent words.
+

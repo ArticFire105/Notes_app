@@ -36,7 +36,9 @@ def model_setup(monkeypatch):
 
 def test_cached_model_uses_text_only_and_card_prompts(model_setup):
     settings, constructor = model_setup
-    first = embeddings.get_embedder()
+    from unittest.mock import patch
+    with patch("torch.cuda.is_available", return_value=False):
+        first = embeddings.get_embedder()
     assert embeddings.get_embedder() is first
     constructor.assert_called_once_with(
         model_name=settings.embedding_model,
@@ -84,11 +86,11 @@ def test_empty_input_does_not_load_model(model_setup):
     constructor.assert_not_called()
 
 
-def test_gemini_branch_is_explicitly_deferred(model_setup):
+def test_gemini_branch_selects_remote_embedder(model_setup):
     settings, constructor = model_setup
     settings.embedding_provider = "gemini"
-    with pytest.raises(NotImplementedError, match="Phase 10"):
-        embeddings.get_embedder()
+    settings.embedding_model = "gemini-embedding-2"
+    assert isinstance(embeddings.get_embedder(), embeddings.GeminiEmbedder)
     constructor.assert_not_called()
 
 
@@ -205,3 +207,50 @@ def test_failed_batch_identifies_the_individual_chunk_and_video_reason(model_set
         embeddings.embed_documents(["good text", "bad text"])
     assert error.value.chunk_index == 1
     assert "fake-private" not in str(error.value)
+
+
+def test_cuda_is_selected_when_available(model_setup, monkeypatch):
+    import torch
+    _, constructor = model_setup
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch, "set_num_threads", MagicMock())
+    embeddings.get_embedder()
+    assert constructor.call_args.kwargs["model_kwargs"]["device"] == "cuda"
+    torch.set_num_threads.assert_not_called()
+
+
+def test_cpu_thread_cap(model_setup, monkeypatch):
+    import torch
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch, "set_num_threads", MagicMock())
+    monkeypatch.setattr(embeddings.os, "cpu_count", lambda: 12)
+    embeddings.get_embedder()
+    torch.set_num_threads.assert_called_once_with(4)
+
+
+def test_gemini_batches_and_retries_without_logging_text(monkeypatch, caplog):
+    settings = SimpleNamespace(embedding_model="gemini-embedding-2", embedding_dim=768, google_api_key=SecretStr("test-secret"))
+    calls = []
+    response = SimpleNamespace(status_code=200, json=lambda: {"embeddings": [{"values": [1.0] * 768}, {"values": [2.0] * 768}]})
+    def post(url, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(status_code=429) if len(calls) == 1 else response
+    monkeypatch.setattr(embeddings.httpx, "post", post)
+    monkeypatch.setattr(embeddings.time, "sleep", lambda _: None)
+    vectors = embeddings.GeminiEmbedder(settings).embed_documents(["private text", "other text"])
+    assert len(vectors) == 2
+    assert len(calls) == 2
+    assert calls[0]["json"]["requests"][0]["outputDimensionality"] == 768
+    assert "private text" not in caplog.text and "test-secret" not in caplog.text
+
+
+def test_gemini_query_uses_search_prefix(monkeypatch):
+    settings = SimpleNamespace(embedding_model="gemini-embedding-2", embedding_dim=768, google_api_key=SecretStr("dummy"))
+    observed = []
+    def post(url, **kwargs):
+        observed.extend(kwargs["json"]["requests"])
+        return SimpleNamespace(status_code=200, json=lambda: {"embeddings": [{"values": [0.1] * 768}]})
+    monkeypatch.setattr(embeddings.httpx, "post", post)
+    monkeypatch.setattr(embeddings.time, "sleep", lambda _: None)
+    assert len(embeddings.GeminiEmbedder(settings).embed_query("paging")) == 768
+    assert observed[0]["content"]["parts"][0]["text"] == "task: search result | query: paging"

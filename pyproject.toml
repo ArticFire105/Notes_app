@@ -26,7 +26,6 @@ dependencies = [
     "langchain-google-genai",
     "pillow>=13.0.0",
     "torchvision>=0.29.1",
-    "indra-ocr>=1.1.2",
 ]
 
 [dependency-groups]

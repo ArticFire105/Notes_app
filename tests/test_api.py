@@ -39,7 +39,7 @@ from contextlib import contextmanager
 from io import BytesIO
 import sqlite3
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 from uuid import UUID
 
 from fastapi import BackgroundTasks
@@ -244,7 +244,9 @@ def test_cli_document_without_storage_has_no_url(client, backend, record):
     backend.sign.assert_not_called()
 
 
-def test_upload_returns_processing_and_schedules_ingest(client, backend, record, pdf):
+def test_upload_returns_processing_and_schedules_ingest(client, backend, record, pdf, monkeypatch):
+    enqueue = MagicMock()
+    monkeypatch.setattr(documents, "enqueue_document", enqueue)
     backend.cursor.fetchone.side_effect = [{"code": "OS"}, {"number": 2}, record]
     response = post_pdf(client, pdf)
     assert response.status_code == 202
@@ -257,17 +259,18 @@ def test_upload_returns_processing_and_schedules_ingest(client, backend, record,
                   if "insert into documents" in call.args[0])
     assert "uploaded_by" in insert.args[0]
     assert insert.args[1][-1] == DOCUMENT_ID
-    backend.ingest.assert_called_once_with(
-        pdf, "OS", 2, "Memory", document_id=DOCUMENT_ID, file_type="pdf"
-    )
+    assert enqueue.call_args.args[1] == (pdf, DOCUMENT_ID, "OS", 2, "Memory", "pdf")
 
 
-def test_ingest_is_queued_not_run_by_upload_handler(backend, record, pdf):
+def test_ingest_is_queued_not_run_by_upload_handler(backend, record, pdf, monkeypatch):
     backend.cursor.fetchone.side_effect = [{"code": "OS"}, {"number": 2}, record]
     tasks = BackgroundTasks()
+    enqueue = MagicMock()
+    monkeypatch.setattr(documents, "enqueue_document", enqueue)
     documents.queue_document(tasks, pdf, 1, 12, "Memory", DOCUMENT_ID)
     backend.ingest.assert_not_called()
-    assert len(tasks.tasks) == 1
+    enqueue.assert_called_once()
+    assert enqueue.call_args.args[1][0] == pdf
 
 
 @pytest.mark.parametrize("filename,content_type,content", [
@@ -383,7 +386,9 @@ def make_pptx_bytes(with_slide=True):
     return output.getvalue()
 
 
-def test_pptx_upload_stores_original_format_and_uses_shared_ingest(client, backend, record):
+def test_pptx_upload_stores_original_format_and_uses_shared_ingest(client, backend, record, monkeypatch):
+    enqueue = MagicMock()
+    monkeypatch.setattr(documents, "enqueue_document", enqueue)
     content = make_pptx_bytes()
     backend.cursor.fetchone.side_effect = [{"code": "OS"}, {"number": 2}, record]
     response = client.post(
@@ -393,9 +398,7 @@ def test_pptx_upload_stores_original_format_and_uses_shared_ingest(client, backe
     assert response.status_code == 202
     assert response.json()["file_type"] == "pptx"
     backend.upload.assert_called_once_with(content, f"official/OS/module-2/{DOCUMENT_ID}.pptx")
-    backend.ingest.assert_called_once_with(
-        content, "OS", 2, "Lecture", document_id=DOCUMENT_ID, file_type="pptx",
-    )
+    assert enqueue.call_args.args[1] == (content, DOCUMENT_ID, "OS", 2, "Lecture", "pptx")
 
 
 @pytest.mark.parametrize("filename,content", [
@@ -932,3 +935,236 @@ def test_admin_delete_module_removes_documents_but_not_personal_notes(client, ba
     assert "delete from documents where module_id" in sql
     assert "delete from modules" in sql
     assert "delete from personal_notes" not in sql
+
+
+def test_upload_queue_runs_one_at_a_time_and_continues_after_failure(monkeypatch):
+    from queue import Queue
+    from uuid import uuid4
+    from app.routers import documents
+    import time
+    queue = Queue()
+    monkeypatch.setattr(documents, "_queue", queue)
+    monkeypatch.setattr(documents, "_queue_items", {})
+    monkeypatch.setattr(documents, "_worker_started", False)
+    seen = []
+    def finish(data, document_id, *args):
+        seen.append(data)
+        if data == b"first":
+            raise RuntimeError("failure")
+    monkeypatch.setattr(documents, "finish_upload", finish)
+    monkeypatch.setattr(documents, "get_document", lambda document_id: {"status": "ready", "error": None})
+    first, second = uuid4(), uuid4()
+    documents.enqueue_document({"id": first}, (b"first", first, "OS", 1, "One", "pdf"))
+    documents.enqueue_document({"id": second}, (b"second", second, "OS", 1, "Two", "pdf"))
+    queue.join()
+    assert seen == [b"first", b"second"]
+    assert documents._queue_items[first]["queue_status"] == "failed"
+    assert documents._queue_items[second]["queue_status"] == "ready"
+
+
+def test_upload_queue_requires_admin(client):
+    main.app.dependency_overrides[get_current_user] = lambda: {"id": DOCUMENT_ID, "email": "student@dxb.manipal.edu", "role": "student"}
+    assert client.get("/admin/upload-queue").status_code == 403
+    assert client.post(f"/admin/upload-queue/{DOCUMENT_ID}/retry").status_code == 403
+
+
+def test_retry_failed_upload_requeues_stored_file(monkeypatch):
+    from queue import Queue
+    from app.routers import documents
+    context = MagicMock()
+    cursor = context.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = {"title": "Lecture", "storage_path": "official/test.pdf", "code": "OS", "number": 2}
+    cursor.rowcount = 1
+    queue = Queue()
+    item = {"id": DOCUMENT_ID, "queue_status": "failed", "status": "failed", "error": "failed"}
+    monkeypatch.setattr(documents, "_queue_items", {DOCUMENT_ID: item})
+    monkeypatch.setattr(documents, "_queue", queue)
+    monkeypatch.setattr(documents, "get_conn", context)
+    monkeypatch.setattr(documents, "download_document", lambda path: b"stored")
+    assert documents.retry_upload(DOCUMENT_ID, {"role": "admin"}) == {"queued": True}
+    assert queue.get_nowait() == (b"stored", DOCUMENT_ID, "OS", 2, "Lecture", "pdf")
+    assert item["queue_status"] == "queued" and item["error"] is None
+
+
+def test_worksheet_extraction_preserves_unknown_fields(monkeypatch):
+    from app.routers import worksheets
+    from pydantic import SecretStr
+    import json
+    config = SimpleNamespace(chat_model="google_genai:gemini-3.5-flash-lite", google_api_key=SecretStr("fake-key"))
+    monkeypatch.setattr(worksheets, "Settings", lambda: config)
+    payload = {"questions": [{"question_text": "Explain paging", "question_number": "1", "module_number": None, "year": None, "marks": None, "question_type": "short"}]}
+    response = SimpleNamespace(status_code=200, json=lambda: {"candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": json.dumps(payload)}]}}]})
+    post = MagicMock(return_value=response)
+    monkeypatch.setattr(worksheets.httpx, "post", post)
+    assert worksheets.extract_questions([(b"image", "image/png")]) == [(None, None, "1", None, "short", "Explain paging")]
+    assert post.call_count == 1
+
+
+def test_worksheet_without_evidence_never_calls_model(monkeypatch):
+    from app.routers import worksheets
+    monkeypatch.setattr(worksheets, "retrieve", lambda *args: [])
+    model = MagicMock()
+    monkeypatch.setattr(worksheets, "get_chat_model", model)
+    answer, sources = worksheets.answer_one("Question", 1, "normal", None)
+    assert answer == worksheets.NOT_FOUND and sources == []
+    model.assert_not_called()
+
+
+def test_worksheet_owner_check_precedes_questions(client, monkeypatch):
+    from app.routers import worksheets
+    context = MagicMock()
+    cursor = context.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = None
+    monkeypatch.setattr(worksheets, "get_conn", context)
+    assert client.get(f"/worksheets/{DOCUMENT_ID}").status_code == 404
+    assert cursor.execute.call_count == 1
+    assert cursor.execute.call_args.args[1] == (DOCUMENT_ID, DOCUMENT_ID)
+
+
+def test_worksheet_stores_all_questions_before_answering(monkeypatch):
+    from app.routers import worksheets
+    connection = MagicMock()
+    cursor = connection.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
+    cursor.fetchall.return_value = [(10,), (11,)]
+    monkeypatch.setattr(worksheets, "get_conn", connection)
+    monkeypatch.setattr(worksheets, "extract_questions", lambda *args: [(None, None, "1", None, None, "First"), (None, None, "2", None, None, "Second")])
+    answered = []
+    def answer(worksheet_id, question_id, user_id, api_key):
+        inserts = [call for call in cursor.execute.call_args_list if "insert into worksheet_questions" in call.args[0]]
+        assert len(inserts) == 2
+        answered.append(question_id)
+    monkeypatch.setattr(worksheets, "answer_question_job", answer)
+    worksheets.run_worksheet(DOCUMENT_ID, DOCUMENT_ID, [])
+    assert answered == [10, 11]
+
+
+def test_worksheet_question_failure_is_saved_without_raw_error(monkeypatch):
+    from app.routers import worksheets
+    connection = MagicMock()
+    cursor = connection.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = {"question_text": "private", "subject_id": 1, "mode": "normal"}
+    monkeypatch.setattr(worksheets, "get_conn", connection)
+    monkeypatch.setattr(worksheets, "answer_one", MagicMock(side_effect=RuntimeError("private secret")))
+    worksheets.answer_question_job(DOCUMENT_ID, 1, DOCUMENT_ID)
+    params = cursor.execute.call_args.args[1]
+    assert "private secret" not in str(params)
+    assert "failed" in cursor.execute.call_args.args[0]
+
+
+def test_worksheet_server_calls_respect_quota_and_byok(monkeypatch):
+    from app.routers import worksheets
+    from pydantic import SecretStr
+    monkeypatch.setattr(worksheets.quota, "dubai_day", lambda: "today")
+    consume = MagicMock(return_value=False)
+    monkeypatch.setattr(worksheets.quota, "try_consume", consume)
+    with pytest.raises(worksheets.WorksheetQuotaExceeded):
+        worksheets.reserve_call(DOCUMENT_ID, None)
+    assert worksheets.reserve_call(DOCUMENT_ID, SecretStr("dummy")) is None
+    consume.assert_called_once_with(DOCUMENT_ID, "today")
+
+
+def test_worksheet_quota_pause_keeps_question_queued(monkeypatch):
+    from app.routers import worksheets
+    context = MagicMock()
+    cursor = context.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = {"question_text": "private", "subject_id": 1, "mode": "normal", "marks": 3, "question_type": "short"}
+    monkeypatch.setattr(worksheets, "get_conn", context)
+    monkeypatch.setattr(worksheets, "answer_one", MagicMock(side_effect=worksheets.WorksheetQuotaExceeded()))
+    assert worksheets.answer_question_job(DOCUMENT_ID, 1, DOCUMENT_ID) is False
+    assert "status='queued'" in cursor.execute.call_args.args[0]
+
+
+def test_worksheet_answer_records_server_token_usage(monkeypatch):
+    from app.routers import worksheets
+    hit = {"document_id": DOCUMENT_ID, "document": "Lecture", "page": 1, "module": 1, "subject": "OS", "score": 0.9, "content": "example", "file_type": "pdf"}
+    monkeypatch.setattr(worksheets, "retrieve", lambda *args: [hit])
+    monkeypatch.setattr(worksheets, "Settings", lambda: SimpleNamespace(max_context_tokens=1000))
+    monkeypatch.setattr(worksheets.quota, "dubai_day", lambda: "today")
+    consume = MagicMock(return_value=True)
+    record = MagicMock()
+    monkeypatch.setattr(worksheets.quota, "try_consume", consume)
+    monkeypatch.setattr(worksheets.quota, "record_usage", record)
+    model = MagicMock()
+    model.invoke.return_value = SimpleNamespace(content="Answer [1]", usage_metadata={"input_tokens": 12, "output_tokens": 5})
+    monkeypatch.setattr(worksheets, "get_chat_model", lambda *args: model)
+    answer, sources = worksheets.answer_one("Question", 1, "strict", None, DOCUMENT_ID, 3, "short")
+    assert answer == "Answer [1]" and len(sources) == 1
+    consume.assert_called_once_with(DOCUMENT_ID, "today")
+    record.assert_called_once_with(DOCUMENT_ID, 12, 5, day="today")
+
+
+@pytest.mark.parametrize("marks, expected", [
+    (1, "2 to 4 key points"), (2, "2 to 4 key points"),
+    (3, "three clear points"), (4, "structured answer"),
+    (5, "structured answer"), (12, "structured answer"),
+    (45, "structured answer"),
+])
+def test_worksheet_answer_uses_mark_ranges(monkeypatch, marks, expected):
+    from app.routers import worksheets
+    hit = {"document_id": DOCUMENT_ID, "document": "Lecture", "page": 1, "module": 1,
+           "subject": "OS", "score": 0.9, "content": "example", "file_type": "pdf"}
+    monkeypatch.setattr(worksheets, "retrieve", lambda *args: [hit])
+    monkeypatch.setattr(worksheets, "Settings", lambda: SimpleNamespace(max_context_tokens=1000))
+    model = MagicMock()
+    model.invoke.return_value = SimpleNamespace(content="Answer [1]", usage_metadata={})
+    monkeypatch.setattr(worksheets, "get_chat_model", lambda *args: model)
+    worksheets.answer_one("Question", 1, "normal", "dummy", marks=marks)
+    instruction = model.invoke.call_args.args[0][0][1]
+    assert expected in instruction
+
+
+def test_worksheet_chat_selects_multiple_question_numbers():
+    from app.routers import worksheets
+    rows = [{"id": 1, "position": 5, "question_number": "5"}, {"id": 2, "position": 6, "question_number": "6"}, {"id": 3, "position": 20, "question_number": "20"}]
+    assert [row["id"] for row in worksheets.selected_questions(rows, "compare Q5 and Q6", None)] == [1, 2]
+    assert [row["id"] for row in worksheets.selected_questions(rows, "explain 20 more simply", None)] == [3]
+    assert worksheets.selected_questions(rows, "now even simpler", None) == rows
+
+
+def test_worksheet_followup_uses_saved_answer_and_cited_evidence(monkeypatch):
+    from app.routers import worksheets
+    source = {"n": 1, "document_id": str(DOCUMENT_ID), "page": 2, "score": 0.9}
+    row = {"question_text": "What is paging?", "answer": "Saved explanation [1]", "sources": [source]}
+    hit = {"document_id": DOCUMENT_ID, "document": "Lecture", "page": 2, "module": 1, "subject": "OS", "score": 0.9, "content": "Evidence", "file_type": "pdf"}
+    search = MagicMock(return_value=[])
+    monkeypatch.setattr(worksheets, "retrieve", search)
+    monkeypatch.setattr(worksheets, "previous_source_hits", lambda *args: [hit])
+    monkeypatch.setattr(worksheets, "Settings", lambda: SimpleNamespace(max_context_tokens=1000))
+    model = MagicMock()
+    model.invoke.return_value = SimpleNamespace(content="Simpler explanation [1]", usage_metadata={})
+    monkeypatch.setattr(worksheets, "get_chat_model", lambda *args: model)
+    answer, sources = worksheets.chat_answer([row], [], 1, "normal", "explain this more simply", DOCUMENT_ID, "dummy")
+    assert answer == "Simpler explanation [1]" and sources[0]["page"] == 2
+    assert "What is paging?" in search.call_args.args[0]
+    assert "explain this more simply" in search.call_args.args[0]
+    assert "Saved explanation" in model.invoke.call_args.args[0][1][1]
+
+
+def test_delete_worksheet_requires_owner_and_marks_cancelled(monkeypatch):
+    from app.routers import worksheets
+    from uuid import uuid4
+    worksheet_id = uuid4()
+    connection = MagicMock()
+    cursor = connection.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = (worksheet_id,)
+    monkeypatch.setattr(worksheets, "get_conn", connection)
+    monkeypatch.setattr(worksheets, "_deleted", set())
+    assert worksheets.delete_worksheet(worksheet_id, {"id": DOCUMENT_ID}) == {"deleted": True}
+    assert cursor.execute.call_args.args[1] == (worksheet_id, DOCUMENT_ID)
+    assert worksheet_id in worksheets._deleted
+    cursor.fetchone.return_value = None
+    with pytest.raises(worksheets.HTTPException) as error:
+        worksheets.delete_worksheet(uuid4(), {"id": DOCUMENT_ID})
+    assert error.value.status_code == 404
+
+
+def test_worksheet_chat_can_use_saved_answer_without_retrieval(monkeypatch):
+    from app.routers import worksheets
+    row = {"question_text": "Explain paging", "answer": "Saved answer", "sources": []}
+    monkeypatch.setattr(worksheets, "retrieve", lambda *args: [])
+    model = MagicMock()
+    model.invoke.return_value = SimpleNamespace(content="A simpler saved answer", usage_metadata={})
+    monkeypatch.setattr(worksheets, "get_chat_model", lambda *args: model)
+    answer, sources = worksheets.chat_answer([row], [], 1, "normal", "simplify", DOCUMENT_ID, "dummy")
+    assert answer.startswith("A simpler saved answer") and "No verified citations" in answer and sources == []
+    assert "Saved answer" in model.invoke.call_args.args[0][1][1]

@@ -54,8 +54,14 @@ def install_header_redaction():
             message += record.stack_info.lower()
         # Header dumps can be mappings, byte tuples, or formatted strings.
         # Drop the whole diagnostic instead of guessing where a secret ends.
-        if "authorization" in message or "x-user-api-key" in message:
+        if "authorization" in message or "x-user-api-key" in message or "x-goog-api-key" in message:
             record.msg = "[redacted sensitive headers]"
+            record.args = ()
+            record.exc_info = None
+            record.exc_text = None
+            record.stack_info = None
+        elif re.search(r"https?://|www\.", message):
+            record.msg = re.sub(r"(?:https?://|www\.)\S+", "[URL redacted]", record.getMessage(), flags=re.IGNORECASE)
             record.args = ()
             record.exc_info = None
             record.exc_text = None

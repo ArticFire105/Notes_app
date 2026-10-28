@@ -44,7 +44,7 @@ from fastapi.responses import JSONResponse
 from app.embeddings import get_embedder
 from app.auth import get_current_user
 from app.logging_safety import install_header_redaction
-from app.routers import ask, documents, login, me, subjects, notes
+from app.routers import ask, documents, login, me, subjects, notes, worksheets
 
 
 @asynccontextmanager
@@ -98,6 +98,7 @@ def create_app():
     application.include_router(ask.router, dependencies=[Depends(get_current_user)])
     application.include_router(me.router)
     application.include_router(notes.router)
+    application.include_router(worksheets.router)
     return application
 
 

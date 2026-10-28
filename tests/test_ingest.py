@@ -397,7 +397,7 @@ def test_pipeline_logs_real_stack_without_exception_messages_or_secrets(ingestio
         assert value not in str(error.value)
 
 
-def test_embedding_failure_logs_original_chunk_index_and_only_80_preview_characters(ingestion, caplog, monkeypatch):
+def test_embedding_failure_logs_original_chunk_index_without_document_text(ingestion, caplog, monkeypatch):
     from app.embeddings import EmbeddingError
     monkeypatch.setattr(pipeline, "load_pptx_pages", lambda path: ([{"page": 2, "text": "notes"}], 1))
     text = "pages map to physical frames " * 5 + "outside preview"
@@ -409,8 +409,7 @@ def test_embedding_failure_logs_original_chunk_index_and_only_80_preview_charact
     with pytest.raises(pipeline.IngestError, match="Chunk 33:.*video preprocessing.*ImportError") as error:
         pipeline.ingest_document(b"fake", "OS", 2, "Lecture", file_type="pptx")
     assert error.value.safe_reason.startswith("Chunk 33:")
-    preview = next(record.getMessage() for record in caplog.records if "preview:" in record.getMessage())
-    assert preview.split("preview: ", 1)[1] == text[:80]
+    assert "pages map to physical frames" not in caplog.text
     assert "outside preview" not in caplog.text
     ingestion.context.assert_not_called()
 
@@ -465,9 +464,135 @@ def test_extract_pptx_picture_and_skip_small_icon():
     assert figures[0]["data"].startswith(b"\xff\xd8")
 
 
-def test_ocr_cleaning_removes_markup_without_losing_table_text():
-    from app.ocr import clean_ocr_text
-    result = clean_ocr_text("Heading <table><tr><td>CPU</td><td>Memory</td></tr></table> &lt;div&gt;Text&lt;/div&gt; <script>junk</script>")
-    assert "<" not in result and ">" not in result
-    assert "CPU" in result and "Memory" in result and "Text" in result
-    assert "junk" not in result
+def test_gemini_ocr_rejects_repetition_before_indexing(monkeypatch):
+    from app import ocr
+    from types import SimpleNamespace
+    monkeypatch.setattr(ocr, "Settings", lambda: SimpleNamespace(ocr_model="gemini-3.5-flash-lite", google_api_key="dummy"))
+    class Response:
+        status_code = 200
+        def raise_for_status(self):
+            pass
+        def json(self):
+            import json
+            return {"candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": json.dumps({"pages": [{"page": 1, "text": "1." * 100}]})}]}}]}
+    monkeypatch.setattr(ocr.httpx, "post", lambda *args, **kwargs: Response())
+    with pytest.raises(ocr.OCRFailure, match="pages 1"):
+        ocr.transcribe(b"image", ".png")
+
+
+def test_ocr_comparison_word_error_rate():
+    from scripts.compare_ocr import word_error_rate
+    assert word_error_rate("Application Software", "application hardware") == 0.5
+
+
+def test_gemini_ocr_uses_request_key_and_preserves_pages(monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from app import ocr
+    monkeypatch.setattr(ocr, "Settings", lambda: SimpleNamespace(ocr_model="gemini-3.5-flash-lite", google_api_key="server"))
+    calls = []
+    class Response:
+        status_code = 200
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": json.dumps({"pages": [{"page": 1, "text": "Application software"}]})}]}}]}
+    def post(url, **kwargs):
+        calls.append(kwargs)
+        return Response()
+    monkeypatch.setattr(ocr.httpx, "post", post)
+    assert ocr.transcribe(b"image", ".png", api_key="student") == [{"page": 1, "text": "Application software"}]
+    assert calls[0]["headers"]["x-goog-api-key"] == "student"
+
+
+def test_gemini_ocr_limits_rate_limit_retries(monkeypatch):
+    from types import SimpleNamespace
+    from app import ocr
+    monkeypatch.setattr(ocr, "Settings", lambda: SimpleNamespace(ocr_model="gemini-3.5-flash-lite", google_api_key="server"))
+    calls = []
+    monkeypatch.setattr(ocr.httpx, "post", lambda *args, **kwargs: calls.append(1) or SimpleNamespace(status_code=429))
+    monkeypatch.setattr(ocr.time, "sleep", lambda seconds: None)
+    with pytest.raises(ocr.OCRFailure, match="quota.*pages 1"):
+        ocr.transcribe(b"image", ".png")
+    assert len(calls) == 3
+
+
+def test_ocr_preserves_good_pages_after_batch_failure(monkeypatch, caplog):
+    from io import BytesIO
+    from types import SimpleNamespace
+    from pypdf import PdfWriter
+    from app import ocr
+    writer = PdfWriter()
+    for _ in range(3):
+        writer.add_blank_page(width=100, height=100)
+    data = BytesIO()
+    writer.write(data)
+    monkeypatch.setattr(ocr, "Settings", lambda: SimpleNamespace(ocr_model="test", google_api_key="secret"))
+    monkeypatch.setattr(ocr.time, "sleep", lambda _: None)
+    def read(data, mime, numbers, model, key):
+        if len(numbers) > 1 or numbers == [2]:
+            return None, "timeout"
+        return [{"page": numbers[0], "text": "valid"}], None
+    monkeypatch.setattr(ocr, "read_batch", read)
+    pages = ocr.transcribe(data.getvalue(), ".pdf")
+    assert [page["page"] for page in pages] == [1, 3]
+    assert pages.failed_pages == [2]
+    assert "timeout" in caplog.text
+    assert "secret" not in caplog.text
+    assert "valid" not in caplog.text
+
+
+def test_ocr_repetition_check_accepts_structured_content():
+    from app.ocr import suspicious
+    assert not suspicious("\n".join(f"{i}. item {i} = value" for i in range(1, 80)))
+    assert not suspicious("\n".join(f"row {i} | 0 | 0 | 0" for i in range(80)))
+    assert not suspicious("\n".join(f"    print({i})" for i in range(80)))
+    assert suspicious("abcd" * 100)
+
+
+def test_progress_reports_each_completed_embedding_batch(ingestion):
+    updates = []
+    pipeline.ingest_document("dummy.pdf", "OS", 2, "Memory", progress=lambda done, total: updates.append((done, total)))
+    assert updates == [(0, 65), (32, 65), (64, 65), (65, 65)]
+
+
+def test_repeated_figures_are_described_once(ingestion, monkeypatch):
+    from unittest.mock import MagicMock
+    figures = [{"page": 1, "data": b"same"}, {"page": 2, "data": b"same"}]
+    describe = MagicMock(return_value="A diagram")
+    monkeypatch.setattr(pipeline, "extract_figures", lambda *args: figures)
+    monkeypatch.setattr(pipeline, "describe_figure", describe)
+    pipeline.ingest_document("dummy.pdf", "OS", 2, "Memory")
+    describe.assert_called_once_with(b"same")
+    assert figures[0]["id"] != figures[1]["id"]
+
+
+def test_reembed_updates_official_and_clears_subject_cache(monkeypatch):
+    from scripts import reembed_all
+    from unittest.mock import MagicMock
+    connection = MagicMock()
+    cursor = connection.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = (1,)
+    cursor.fetchall.side_effect = [[(12, 3, "private")], []]
+    cursor.rowcount = 1
+    monkeypatch.setattr(reembed_all, "get_conn", connection)
+    monkeypatch.setattr(reembed_all, "embed_documents", lambda texts: [[0.0] * 768])
+    invalidate = MagicMock()
+    monkeypatch.setattr(reembed_all, "invalidate_scope", invalidate)
+    assert reembed_all.migrate_table("chunks", "gemini-embedding-2") == 1
+    invalidate.assert_called_once_with(3, cursor)
+    update = next(call for call in cursor.execute.call_args_list if call.args[0].startswith("update chunks"))
+    assert update.args[1][1:3] == ("gemini-embedding-2", 12)
+
+
+def test_reembed_dry_run_never_calls_gemini(monkeypatch):
+    from scripts import reembed_all
+    from unittest.mock import MagicMock
+    connection = MagicMock()
+    cursor = connection.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = (4,)
+    embed = MagicMock()
+    monkeypatch.setattr(reembed_all, "get_conn", connection)
+    monkeypatch.setattr(reembed_all, "embed_documents", embed)
+    assert reembed_all.migrate_table("personal_note_chunks", "gemini-embedding-2", True) == 0
+    embed.assert_not_called()

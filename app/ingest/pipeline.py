@@ -18,7 +18,7 @@ from app.ingest.chunker import chunk_pages
 from app.ingest.figures import extract_figures, describe_figure
 from app.ingest.pdf_loader import load_pdf_pages
 from app.ingest.pptx_loader import NO_READABLE_SLIDES, NoReadableSlidesError, load_pptx_pages
-from app.logging_safety import log_safe_exception, safe_chunk_preview
+from app.logging_safety import log_safe_exception
 
 
 EMBEDDING_BATCH_SIZE = 32
@@ -42,6 +42,7 @@ def ingest_document(
     *,
     document_id: UUID | None = None,
     file_type: str = "pdf",
+    progress=None,
 ) -> UUID:
     started = perf_counter()
     title = title.strip()
@@ -66,9 +67,13 @@ def ingest_document(
                 chunks.append({**chunk, "content": text})
         reason = "Could not extract or describe document figures."
         figures = extract_figures(path, file_type) if source_type == "official" else []
+        descriptions = {}
         for figure in figures:
             label = "Slide" if file_type == "pptx" else "page"
-            caption = describe_figure(figure["data"])
+            # Repeated diagrams need separate page citations, but one description.
+            if figure["data"] not in descriptions:
+                descriptions[figure["data"]] = describe_figure(figure["data"])
+            caption = descriptions[figure["data"]]
             figure["content"] = prepare_embedding_text(f"[Figure on {label} {figure['page']}]: {caption}")
             figure["id"] = uuid4()
         if not chunks and not figures:
@@ -81,9 +86,13 @@ def ingest_document(
         reason = "Could not generate text embeddings."
         vectors = []
         all_chunks = chunks + figures
+        if progress:
+            progress(0, len(all_chunks))
         for start in range(0, len(all_chunks), EMBEDDING_BATCH_SIZE):
             batch = all_chunks[start:start + EMBEDDING_BATCH_SIZE]
             vectors.extend(embed_documents([chunk["content"] for chunk in batch]))
+            if progress:
+                progress(len(vectors), len(all_chunks))
 
         reason = "Could not save document text. Check database availability."
         with get_conn() as connection:
@@ -186,8 +195,8 @@ def ingest_document(
             chunk = batch[error.chunk_index]
             failure_reason = f"Chunk {chunk.get('chunk_index', 'figure')}: {error.safe_reason}"
             logging.getLogger("app.ingest").error(
-                "Embedding failed for chunk index %s; preview: %s",
-                chunk.get("chunk_index", "figure"), safe_chunk_preview(chunk["content"]),
+                "Embedding failed for chunk index %s",
+                chunk.get("chunk_index", "figure"),
             )
         else:
             logging.getLogger("app.ingest").error("Embedding batch failed; no individual failing chunk was reproducible.")

@@ -65,6 +65,8 @@ class DocumentOut(BaseModel):
     created_at: datetime
     error: str | None = None
     file_type: Literal["pdf", "pptx"] = "pdf"
+    embedded_chunks: int | None = None
+    total_chunks: int | None = None
 
 
 class Source(BaseModel):

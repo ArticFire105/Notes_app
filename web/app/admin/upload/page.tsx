@@ -38,7 +38,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { CheckCircle2, FileText, Upload, LoaderCircle, AlertCircle } from "lucide-react";
-import { api, errorMessage, invalidateData, type Document, type Module, type Subject } from "@/lib/api";
+import { api, errorMessage, invalidateData, type Document, type QueueDocument, type Module, type Subject } from "@/lib/api";
 import { useSession } from "@/components/session-provider";
 import { DocumentManager } from "@/components/document-manager";
 import { Button } from "@/components/ui/button";
@@ -58,7 +58,9 @@ export default function UploadPage() {
   const [subjectId, setSubjectId] = useState("");
   const [moduleId, setModuleId] = useState("");
   const [title, setTitle] = useState("");
-  const [file, setFile] = useState<File | null>(null);
+  const [files, setFiles] = useState<File[]>([]);
+  const [queue, setQueue] = useState<QueueDocument[]>([]);
+  const [uploadErrors, setUploadErrors] = useState<string[]>([]);
   const [upload, setUpload] = useState<Document | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadingModules, setLoadingModules] = useState(false);
@@ -89,28 +91,20 @@ export default function UploadPage() {
     return () => { active = false; };
   }, [subjectId, isAdmin]);
 
-  const uploadId = upload?.id;
   useEffect(() => {
-    if (!uploadId || !isAdmin) return;
+    if (!isAdmin) return;
     let active = true;
     let timer: ReturnType<typeof setTimeout>;
     async function poll() {
       try {
-        const current = await api.document(uploadId!);
-        if (!active) return;
-        setUpload(current); setError("");
-        if (current.status !== "processing") {
-          invalidateData("documents");
-          setDocumentVersion(value => value + 1);
-          return;
-        }
-      } catch (error) { if (!active) return; setError(errorMessage(error)); }
-      // Schedule after completion so slow requests never overlap.
-      timer = setTimeout(() => void poll(), 3000);
+        const items = await api.uploadQueue();
+        if (active) setQueue(items);
+      } catch (error) { if (active) setError(errorMessage(error)); }
+      if (active) timer = setTimeout(() => void poll(), 3000);
     }
     void poll();
     return () => { active = false; clearTimeout(timer); };
-  }, [uploadId, isAdmin]);
+  }, [isAdmin]);
 
   async function addSubject(event: React.FormEvent) {
     event.preventDefault();
@@ -169,21 +163,30 @@ export default function UploadPage() {
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
-    if (!file || !title.trim() || !subjectId || !moduleId) { setError("Select a subject, module, title, and PDF or PPTX file."); return; }
-    if (file.name.toLowerCase().endsWith(".ppt")) { setError("Old .ppt files are not supported. Save as .pptx and upload again."); return; }
-    if (!/\.(pdf|pptx)$/i.test(file.name)) { setError("Choose a PDF or .pptx PowerPoint file."); return; }
-    if (file.size > 40 * 1024 * 1024) { setError("The file must be 40 MB or smaller."); return; }
-    setBusy(true); setError("");
-    const data = new FormData();
-    data.set("subject_id", subjectId); data.set("module_id", moduleId);
-    data.set("title", title.trim()); data.set("file", file);
-    try {
-      setUpload(await api.upload(data));
-      setDocumentVersion(value => value + 1);
-      setTitle(""); setFile(null);
-      if (fileInput.current) fileInput.current.value = "";
-    } catch (error) { setError(errorMessage(error)); }
-    finally { setBusy(false); }
+    if (!files.length || !subjectId || !moduleId) { setError("Select a subject, module, and files."); return; }
+    setBusy(true); setError(""); setUploadErrors([]);
+    const errors: string[] = [];
+    for (const file of files) {
+      if (!/\.(pdf|pptx)$/i.test(file.name)) { errors.push(`${file.name}: Choose a PDF or .pptx PowerPoint file.`); continue; }
+      if (file.size > 40 * 1024 * 1024) { errors.push(`${file.name}: The file must be 40 MB or smaller.`); continue; }
+      const data = new FormData();
+      data.set("subject_id", subjectId); data.set("module_id", moduleId);
+      data.set("title", files.length === 1 && title.trim() ? title.trim() : file.name.replace(/\.(pdf|pptx)$/i, ""));
+      data.set("file", file);
+      try { await api.upload(data); }
+      catch (error) { errors.push(`${file.name}: ${errorMessage(error)}`); }
+    }
+    setUploadErrors(errors);
+    try { setQueue(await api.uploadQueue()); } catch { setError("Could not load upload status."); }
+    setDocumentVersion(value => value + 1);
+    setTitle(""); setFiles([]);
+    if (fileInput.current) fileInput.current.value = "";
+    setBusy(false);
+  }
+
+  async function retry(id: string) {
+    try { await api.retryUpload(id); setQueue(await api.uploadQueue()); }
+    catch (error) { setError(errorMessage(error)); }
   }
 
   if (!isAdmin) return <p role="alert" className="p-6 text-sm">Administrator access required.</p>;
@@ -193,19 +196,20 @@ export default function UploadPage() {
     <Card><CardHeader><CardTitle>Add subject</CardTitle><CardDescription>Five placeholder modules are created automatically.</CardDescription></CardHeader><CardContent>
       <form onSubmit={addSubject} className="flex flex-wrap items-end gap-3"><div className="space-y-2"><label htmlFor="subject-code">Code</label><Input id="subject-code" required maxLength={20} value={newCode} onChange={event => setNewCode(event.target.value)} placeholder="e.g. OS" /></div><div className="min-w-48 flex-1 space-y-2"><label htmlFor="subject-name">Name</label><Input id="subject-name" required maxLength={100} value={newName} onChange={event => setNewName(event.target.value)} placeholder="Subject name" /></div><Button type="submit" disabled={addingSubject}>{addingSubject ? "Adding..." : "Add subject"}</Button></form>
     </CardContent></Card>
-    <Card><CardHeader><CardTitle>Upload lecture notes</CardTitle><CardDescription>PDFs and PowerPoint (.pptx), up to 40 MB. Pick the module these notes belong to.</CardDescription></CardHeader><CardContent>
-      {loading ? <p role="status" className="text-sm text-muted-foreground">Loading subjects…</p> : <form onSubmit={submit}><fieldset disabled={busy || upload?.status === "processing"} className="space-y-5">
+    <Card><CardHeader><CardTitle>Upload lecture notes</CardTitle><CardDescription>PDFs and PowerPoint (.pptx), up to 40 MB each. Keep this page open until uploading finishes; indexing continues after you leave.</CardDescription></CardHeader><CardContent>
+      {loading ? <p role="status" className="text-sm text-muted-foreground">Loading subjects…</p> : <form onSubmit={submit}><fieldset disabled={busy} className="space-y-5">
         <div className="grid gap-4 sm:grid-cols-2"><div className="space-y-2"><label htmlFor="upload-subject">Subject</label><select id="upload-subject" value={subjectId} required onChange={event => { setSubjectId(event.target.value); setModuleId(""); setModules([]); }}><option value="" disabled>Select a subject</option>{subjects.map(subject => <option key={subject.id} value={subject.id}>{subject.code} · {subject.name}</option>)}</select></div><div className="space-y-2"><label htmlFor="upload-module">Module</label><select id="upload-module" value={moduleId} required disabled={loadingModules} onChange={event => setModuleId(event.target.value)}><option value="" disabled>{loadingModules ? "Loading modules…" : "Select a module"}</option>{modules.map(module => <option key={module.id} value={module.id}>Module {module.number} · {module.title}</option>)}</select></div></div>
-        <div className="space-y-2"><label htmlFor="title">Document title</label><Input id="title" required maxLength={500} placeholder="e.g. Memory Management" value={title} onChange={event => setTitle(event.target.value)} /></div>
-        <div className="rounded-xl border border-dashed border-primary/30 bg-background/40 p-6 text-center"><Upload size={28} strokeWidth={1.3} className="mx-auto mb-3 text-primary" /><label htmlFor="file" className="mb-2 block">Choose your PDF or PowerPoint</label><Input ref={fileInput} id="file" type="file" accept=".pdf,.pptx,.ppt,application/pdf,application/vnd.openxmlformats-officedocument.presentationml.presentation" required className="mx-auto max-w-sm cursor-pointer bg-white text-xs" onChange={event => setFile(event.target.files?.[0] || null)} /><p className="mt-3 text-xs text-muted-foreground">PDF or PPTX · max 40 MB · save old .ppt as .pptx</p></div>
+        <div className="space-y-2"><label htmlFor="title">Document title</label><Input id="title" maxLength={500} placeholder="e.g. Memory Management" value={title} onChange={event => setTitle(event.target.value)} /></div>
+        <div onDragOver={event => event.preventDefault()} onDrop={event => { event.preventDefault(); setFiles(Array.from(event.dataTransfer.files)); }} className="rounded-xl border border-dashed border-primary/30 bg-background/40 p-6 text-center"><Upload size={28} strokeWidth={1.3} className="mx-auto mb-3 text-primary" /><label htmlFor="file" className="mb-2 block">Choose files or drop them here</label><Input ref={fileInput} id="file" type="file" multiple accept=".pdf,.pptx,.ppt,application/pdf,application/vnd.openxmlformats-officedocument.presentationml.presentation" className="mx-auto max-w-sm cursor-pointer bg-white text-xs" onChange={event => setFiles(Array.from(event.target.files || []))} /><p className="mt-3 text-xs text-muted-foreground">PDF or PPTX · max 40 MB · save old .ppt as .pptx</p></div>
         <Button type="submit" disabled={loadingModules || !moduleId}><Upload size={16} />{busy ? "Uploading…" : "Upload notes"}</Button>
       </fieldset></form>}
     </CardContent></Card>
-    {upload && <Card aria-live="polite"><CardContent className="flex items-start gap-4 pt-6"><span className="mt-1">{upload.status === "ready" ? <CheckCircle2 className="text-emerald-700" /> : upload.status === "failed" ? <AlertCircle className="text-red-700" /> : <LoaderCircle className="animate-spin text-gold" />}</span><div><p className="flex items-center gap-2 text-sm font-semibold"><FileText size={15} />{upload.title}</p><p className="mt-2 text-sm">{upload.status === "ready" ? "Ready. Students can now ask questions about these notes." : upload.status === "failed" ? (upload.error || "Document ingestion failed. Check backend logs for details.") : "Processing your document. Status refreshes every three seconds."}</p></div></CardContent></Card>}
+    {uploadErrors.map(message => <p key={message} role="alert" className="text-sm text-red-700">{message}</p>)}
+    {queue.length > 0 && <Card aria-live="polite"><CardHeader><CardTitle>Upload queue</CardTitle></CardHeader><CardContent className="space-y-3">{queue.map(item => <div key={item.id} className="rounded-lg border p-3"><p className="font-medium">{item.title}</p><p className="text-sm">{item.queue_status === "queued" ? "Queued" : item.queue_status === "indexing" ? item.total_chunks != null ? `Indexing ${item.embedded_chunks ?? 0} of ${item.total_chunks} chunks` : "Indexing: preparing document" : item.queue_status === "ready" ? "Ready" : item.error || "Failed"}</p>{item.queue_status === "failed" && <Button type="button" size="sm" variant="outline" onClick={() => void retry(item.id)}>Retry</Button>}</div>)}</CardContent></Card>}
     {subjectId && <Card><CardHeader><CardTitle>Manage subject and modules</CardTitle></CardHeader><CardContent className="space-y-4">
-      <Button type="button" variant="outline" disabled={managing || busy || upload?.status === "processing"} onClick={() => void deleteSubject()}>Delete this subject</Button>
+      <Button type="button" variant="outline" disabled={managing || busy} onClick={() => void deleteSubject()}>Delete this subject</Button>
       <form onSubmit={addModule} className="flex flex-wrap items-end gap-3"><div><label htmlFor="module-number" className="block text-sm">Number</label><Input id="module-number" type="number" min={1} max={999} required value={newModuleNumber} onChange={event => setNewModuleNumber(event.target.value)} /></div><div className="min-w-48 flex-1"><label htmlFor="module-title" className="block text-sm">Title</label><Input id="module-title" required maxLength={200} value={newModuleTitle} onChange={event => setNewModuleTitle(event.target.value)} /></div><Button type="submit" disabled={managing || !newModuleNumber || !newModuleTitle.trim()}>Add module</Button></form>
-      {modules.map(module => <div key={module.id} className="flex flex-wrap items-center gap-2 rounded-lg border p-3"><span className="min-w-0 flex-1 text-sm">Module {module.number} - {module.title}</span><Button type="button" variant="outline" size="sm" disabled={managing || busy || upload?.status === "processing"} onClick={() => void renameModule(module)}>Rename</Button><Button type="button" variant="outline" size="sm" disabled={managing || busy || upload?.status === "processing"} onClick={() => void deleteModule(module)}>Delete</Button></div>)}
+      {modules.map(module => <div key={module.id} className="flex flex-wrap items-center gap-2 rounded-lg border p-3"><span className="min-w-0 flex-1 text-sm">Module {module.number} - {module.title}</span><Button type="button" variant="outline" size="sm" disabled={managing || busy} onClick={() => void renameModule(module)}>Rename</Button><Button type="button" variant="outline" size="sm" disabled={managing || busy} onClick={() => void deleteModule(module)}>Delete</Button></div>)}
     </CardContent></Card>}
     {subjectId && <DocumentManager key={subjectId} subjectId={Number(subjectId)} subjectCode={subjects.find(subject => String(subject.id) === subjectId)?.code || "this subject"} version={documentVersion} onDeleted={id => { if (upload?.id === id) setUpload(null); }} />}
   </div>;

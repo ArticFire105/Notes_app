@@ -38,12 +38,17 @@ export type Session = { access_token: string; expires_at: number };
 export type Profile = { email: string; role: string };
 export type Subject = { id: number; code: string; name: string };
 export type Module = { id: number; subject_id: number; number: number; title: string };
-export type Document = { id: string; title: string; module: number | null; status: "processing" | "ready" | "failed"; page_count: number | null; file_type: "pdf" | "pptx"; error?: string | null };
+export type Document = { id: string; title: string; module: number | null; status: "processing" | "ready" | "failed"; page_count: number | null; file_type: "pdf" | "pptx"; error?: string | null; embedded_chunks?: number | null; total_chunks?: number | null };
+export type QueueDocument = Document & { queue_status: "queued" | "indexing" | "ready" | "failed" };
+export type Worksheet = { id: string; subject_id: number; mode: "normal" | "strict"; status: string; error: string | null; created_at: string };
+export type WorksheetQuestion = { id: number; position: number; question_number: string | null; question_text: string; marks: number | null; question_type: string | null; status: string; answer: string | null; sources: Source[] | null; error: string | null };
+export type WorksheetTurn = { id: number; question_id: number | null; message: string; answer: string; sources: Source[] };
+export type WorksheetDetail = Worksheet & { questions: WorksheetQuestion[]; chat: WorksheetTurn[] };
 export type Overview = { subject: Subject; modules: Module[]; documents: (Document & { module_id: number })[]; usage: Usage };
 export type Usage = { used: number; limit: number; resets_at: string };
 export type Slide = { number: number; total: number; aspect: number; shapes: { kind: "text" | "image"; left: number; top: number; width: number; height: number; text?: string; data?: string; mime?: string }[] };
-export type NoteJob = { stage: "reading" | "indexing" | "ready" | "failed"; page: number; error?: string };
-export type PersonalNote = { id: string; subject_id: number; title: string; file_type: "pdf" | "image" };
+export type NoteJob = { stage: "reading" | "indexing" | "ready" | "failed"; page: number; total?: number; error?: string; result?: PersonalNote };
+export type PersonalNote = { id: string; subject_id: number; title: string; file_type: "pdf" | "image"; failed_pages: number[] };
 export type Source = { figure_id?: string | null; source_type?: "official" | "personal"; document_id?: string | null; n: number; document: string; module: number | null; page: number; page_label?: string | null; score: number };
 export type Answer = { answer: string; sources: Source[]; remaining: number };
 export type Message = { role: "user" | "assistant"; content: string; sources?: Source[] };
@@ -199,9 +204,9 @@ export const api = {
   me: () => request<Profile>("/me"),
   usage: () => request<Usage>("/me/usage"),
   notes: () => request<PersonalNote[]>("/notes"),
-  startNoteJob: (data: FormData, signal?: AbortSignal) => request<{ id: string }>("/notes/jobs", { method: "POST", body: data, signal }),
+  startNoteJob: (data: FormData, signal?: AbortSignal) => request<{ id: string }>("/notes/jobs", { method: "POST", body: data, signal }, true, true),
   noteJob: (id: string, signal?: AbortSignal) => request<NoteJob>(`/notes/jobs/${id}`, { signal }),
-  uploadNote: (data: FormData) => request<PersonalNote>("/notes", { method: "POST", body: data }).then(value => { invalidateData("documents"); return value; }),
+  uploadNote: (data: FormData) => request<PersonalNote>("/notes", { method: "POST", body: data }, true, true).then(value => { invalidateData("documents"); return value; }),
   deleteNote: (subjectId: number) => request(`/notes/${subjectId}`, { method: "DELETE" }).then(value => { invalidateData("documents"); return value; }),
   noteFile: (id: string) => request<{ url: string }>(`/notes/${id}/file-url`),
   deleteSubject: (id: number) => request(`/subjects/${id}`, { method: "DELETE" }).then(value => { invalidateData(); return value; }),
@@ -223,6 +228,16 @@ export const api = {
     request<Answer>("/ask", { method: "POST", body: JSON.stringify({
       question, subject_id: subjectId, module_id: moduleId, document_id: documentId, mode, history: history.slice(-6).map(({ role, content, sources }) => ({ role, content: content.slice(0, 2000), sources: sources?.slice(0, 5) || [] })),
     }) }, true, true).then(value => { invalidateData("usage"); return value; }),
+  worksheets: (subjectId: number) => request<Worksheet[]>(`/worksheets?subject_id=${subjectId}`),
+  worksheet: (id: string) => request<WorksheetDetail>(`/worksheets/${id}`),
+  uploadWorksheet: (data: FormData) => request<{ id: string }>("/worksheets", { method: "POST", body: data }, true, true),
+  deleteWorksheet: (id: string) => request<{ deleted: boolean }>(`/worksheets/${id}`, { method: "DELETE" }),
+  worksheetMode: (id: string, mode: string) => request<{ mode: string }>(`/worksheets/${id}/mode`, { method: "POST", body: JSON.stringify({ mode }) }),
+  answerWorksheet: (id: string) => request<{ queued: boolean }>(`/worksheets/${id}/answer-all`, { method: "POST" }, true, true),
+  askWorksheet: (id: string, questionId: number | null, message: string) => request<{ answer: string; sources: Source[] }>(`/worksheets/${id}/ask`, { method: "POST", body: JSON.stringify({ question_id: questionId, message }) }, true, true),
+  retryWorksheetQuestion: (id: string, question: number) => request<{ queued: boolean }>(`/worksheets/${id}/questions/${question}/retry`, { method: "POST" }, true, true),
+  uploadQueue: () => request<QueueDocument[]>("/admin/upload-queue"),
+  retryUpload: (id: string) => request<{ queued: boolean }>(`/admin/upload-queue/${id}/retry`, { method: "POST" }),
   upload: (data: FormData) => request<Document>("/documents", { method: "POST", body: data }).then(value => { invalidateData("documents"); return value; }),
   deleteDocument: (id: string) => request<{ deleted: boolean; id: string }>(`/documents/${id}`, { method: "DELETE" }).then(value => { invalidateData("documents"); return value; }),
 };
@@ -247,9 +262,9 @@ export async function processNote(data: FormData, update: (message: string) => v
       if (statusController.signal.aborted) throw new ApiError("Status check timed out. Processing may still finish; check My Notes before retrying.");
       throw error;
     } finally { clearTimeout(statusTimer); }
-    if (status.stage === "ready") { invalidateData("documents"); update("Ready"); return; }
+    if (status.stage === "ready") { invalidateData("documents"); update("Ready"); return status.result; }
     if (status.stage === "failed") throw new ApiError(status.error || "Processing failed. Please try again.");
-    update(status.stage === "indexing" ? "Indexing your note..." : `Reading handwriting${status.page ? ` - page ${status.page}` : "..."}`);
+    update(status.stage === "indexing" ? `Indexing your note: ${status.page} of ${status.total} chunks` : `Reading handwriting${status.page ? ` - through page ${status.page}` : "..."}`);
     await new Promise(resolve => setTimeout(resolve, 2000));
   }
   throw new ApiError("Processing is taking longer than 30 minutes. It may still finish; check My Notes before retrying.");

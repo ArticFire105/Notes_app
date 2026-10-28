@@ -55,12 +55,13 @@ class Settings(BaseSettings):
     supabase_anon_key: SecretStr
     supabase_service_role_key: SecretStr
     google_api_key: SecretStr
-    hf_token: SecretStr
+    hf_token: SecretStr = SecretStr("")
 
-    embedding_provider: Literal["local", "gemini"] = "local"
-    embedding_model: str = "google/embeddinggemma-2"
+    embedding_provider: Literal["local", "gemini"] = "gemini"
+    embedding_model: str = "gemini-embedding-2"
     embedding_dim: int = 768
     chat_model: str = "google_genai:gemini-3.5-flash-lite"
+    ocr_model: str = "gemini-3.5-flash-lite"
     max_output_tokens: int = Field(default=800, gt=0)
     allowed_email_domain: str = "dxb.manipal.edu"
     questions_per_day: int = Field(default=5, gt=0)

@@ -40,6 +40,8 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from threading import Lock, Thread
+from queue import Queue
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -63,6 +65,12 @@ from app.schemas import DocumentOut
 from app.storage import delete_document, download_document, restore_document, signed_url, upload_document
 
 router = APIRouter()
+_progress = {}
+_progress_lock = Lock()
+_queue = Queue()
+_queue_items = {}
+_queue_lock = Lock()
+_worker_started = False
 MAX_UPLOAD_BYTES = 40 * 1024 * 1024
 PPTX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 DELETE_FAILED = "Could not complete document deletion. Please retry or check backend logs."
@@ -86,13 +94,19 @@ def get_document(document_id: UUID):
             document = cursor.fetchone()
     if document is None:
         raise HTTPException(404, "Document not found.")
+    with _progress_lock:
+        document.update(_progress.get(document_id, {}))
     return document
 
 
 def finish_upload(file_bytes, document_id, subject_code, module_number, title, file_type="pdf"):
+    def report(completed, total):
+        with _progress_lock:
+            _progress[document_id] = {"embedded_chunks": completed, "total_chunks": total}
+
     try:
         ingest_document(file_bytes, subject_code, module_number, title,
-                        document_id=document_id, file_type=file_type)
+                        document_id=document_id, file_type=file_type, progress=report)
     except Exception as error:
         if isinstance(error, IngestError):
             reason = error.safe_reason
@@ -110,7 +124,81 @@ def finish_upload(file_bytes, document_id, subject_code, module_number, title, f
             # If the DB itself is unavailable, status cannot be persisted yet.
             log_safe_exception(status_error, "Could not record ingestion failure status.")
             return
+    finally:
+        with _progress_lock:
+            _progress.pop(document_id, None)
 
+
+
+def _process_queue():
+    while True:
+        job = _queue.get()
+        document_id = job[1]
+        try:
+            with _queue_lock:
+                _queue_items[document_id]["queue_status"] = "indexing"
+            finish_upload(*job)
+            document = get_document(document_id)
+            with _queue_lock:
+                _queue_items[document_id].update(status=document["status"], error=document.get("error"), queue_status=document["status"])
+        except Exception:
+            with _queue_lock:
+                _queue_items[document_id].update(status="failed", queue_status="failed", error="Could not process this file. Please retry.")
+        finally:
+            _queue.task_done()
+
+
+def enqueue_document(document, job):
+    global _worker_started
+    document_id = job[1]
+    with _queue_lock:
+        _queue_items[document_id] = {**document, "queue_status": "queued"}
+        _queue.put(job)
+        if not _worker_started:
+            Thread(target=_process_queue, daemon=True).start()
+            _worker_started = True
+
+
+@router.get("/admin/upload-queue")
+def upload_queue(user=Depends(require_role("admin"))):
+    with _queue_lock:
+        items = [dict(item) for item in _queue_items.values()]
+    with _progress_lock:
+        for item in items:
+            item.update(_progress.get(item["id"], {}))
+    return items
+
+
+@router.post("/admin/upload-queue/{document_id}/retry", status_code=202)
+def retry_upload(document_id: UUID, user=Depends(require_role("admin"))):
+    with _queue_lock:
+        item = _queue_items.get(document_id)
+        if not item or item["queue_status"] != "failed":
+            raise HTTPException(409, "Only a failed upload can be retried.")
+        item["queue_status"] = "queued"
+    try:
+        with get_conn() as connection:
+            with connection.cursor(row_factory=dict_row) as cursor:
+                cursor.execute("""select d.title, d.storage_path, s.code, m.number
+                    from documents d join subjects s on s.id = d.subject_id
+                    join modules m on m.id = d.module_id
+                    where d.id = %s and d.status = 'failed' and d.source_type = 'official'""", (document_id,))
+                row = cursor.fetchone()
+                if not row or not row["storage_path"]:
+                    raise HTTPException(404, "The uploaded file is no longer available.")
+                data = download_document(row["storage_path"])
+                cursor.execute("update documents set status = 'processing', error = null where id = %s and status = 'failed'", (document_id,))
+                if cursor.rowcount != 1:
+                    raise HTTPException(409, "This upload is no longer failed.")
+        file_type = "pptx" if row["storage_path"].lower().endswith(".pptx") else "pdf"
+        with _queue_lock:
+            item.update(status="processing", error=None)
+            _queue.put((data, document_id, row["code"], row["number"], row["title"], file_type))
+        return {"queued": True}
+    except Exception:
+        with _queue_lock:
+            item["queue_status"] = "failed"
+        raise
 
 @router.get("/modules/{module_id}/documents", response_model=list[DocumentOut])
 def list_documents(module_id: int):
@@ -220,9 +308,7 @@ def queue_document(background_tasks, file_bytes, subject_id, module_id, title, u
         raise HTTPException(500, "Could not record the uploaded document.") from None
     document["module"] = module["number"]
     document["file_type"] = file_type
-    background_tasks.add_task(
-        finish_upload, file_bytes, document_id, subject["code"], module["number"], title, file_type
-    )
+    enqueue_document(document, (file_bytes, document_id, subject["code"], module["number"], title, file_type))
     return document
 
 

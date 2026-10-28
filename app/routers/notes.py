@@ -3,7 +3,7 @@ Manage each student's private note for each subject.
 The authenticated profile determines the owner.
 The browser cannot supply a different owner.
 Files are checked before OCR or storage.
-Indra transcribes locally on the backend CPU.
+Gemini transcribes the upload using the selected request key.
 Only transcribed text is sent to the embedder.
 Each note can contain several original pages.
 Page numbers are kept for answer citations.
@@ -54,6 +54,8 @@ from app.db import get_conn
 from app.embeddings import embed_documents
 from app.ingest.chunker import chunk_pages
 from app.ocr import transcribe
+from app.ocr import OCRFailure
+from app.llm import user_api_key
 from app.storage import personal_bucket
 
 router = APIRouter(prefix="/notes", tags=["personal notes"])
@@ -75,7 +77,7 @@ def has_note(user_id, subject_id):
 def my_notes(user=Depends(get_current_user)):
     with get_conn() as connection:
         with connection.cursor(row_factory=dict_row) as cursor:
-            cursor.execute("""select id, subject_id, title, file_type, created_at from personal_notes
+            cursor.execute("""select id, subject_id, title, file_type, created_at, failed_pages from personal_notes
                               where user_id = %s order by created_at desc""", (user["id"],))
             return cursor.fetchall()
 
@@ -97,7 +99,7 @@ def validate_file(data, filename):
     raise ValueError("Upload a PDF, PNG, or JPEG image.")
 
 
-def save_note(data, filename, subject_id, replace, user_id, progress=None):
+def save_note(data, filename, subject_id, replace, user_id, progress=None, api_key=None):
     try:
         suffix, file_type, content_type = validate_file(data, filename)
     except Exception:
@@ -112,17 +114,28 @@ def save_note(data, filename, subject_id, replace, user_id, progress=None):
     try:
         if progress:
             progress("reading", 0)
-            pages = transcribe(data, suffix, progress=lambda page: progress("reading", page))
-            progress("indexing", len(pages))
+            options = {"progress": lambda page: progress("reading", page)}
+            if api_key is not None:
+                options["api_key"] = api_key
+            pages = transcribe(data, suffix, **options)
         else:
-            pages = transcribe(data, suffix)
+            pages = transcribe(data, suffix, api_key=api_key) if api_key is not None else transcribe(data, suffix)
+        failed_pages = getattr(pages, "failed_pages", [])
+        if failed_pages and replace:
+            raise OCRFailure("Could not read pages " + ", ".join(map(str, failed_pages)) + ". Your previous note is unchanged.")
         chunks = chunk_pages(pages)
         if not chunks:
             raise ValueError("Empty transcription")
-        vectors = embed_documents([item["content"] for item in chunks])
+        vectors = []
+        for start in range(0, len(chunks), 8):
+            vectors.extend(embed_documents([item["content"] for item in chunks[start:start + 8]]))
+            if progress:
+                progress("indexing", len(vectors), len(chunks))
         model = Settings().embedding_model
+    except OCRFailure as error:
+        raise HTTPException(503, str(error)) from None
     except Exception:
-        raise HTTPException(503, "Could not read or process this note. Check the local OCR setup and try again.") from None
+        raise HTTPException(503, "Could not read or process this note. Please try again.") from None
     note_id = uuid4()
     path = f"{user_id}/{note_id}{suffix}"
     bucket = personal_bucket()
@@ -150,9 +163,9 @@ def save_note(data, filename, subject_id, replace, user_id, progress=None):
                     old_path, old_type = old
                     old_bytes = bucket.download(old_path)
                     cursor.execute("delete from personal_notes where user_id = %s and subject_id = %s", (user_id, subject_id))
-                cursor.execute("""insert into personal_notes (id, user_id, subject_id, title, storage_path, file_type)
-                                  values (%s, %s, %s, %s, %s, %s)""",
-                               (note_id, user_id, subject_id, "My note", path, file_type))
+                cursor.execute("""insert into personal_notes (id, user_id, subject_id, title, storage_path, file_type, failed_pages)
+                                  values (%s, %s, %s, %s, %s, %s, %s)""",
+                               (note_id, user_id, subject_id, "My note", path, file_type, failed_pages))
                 cursor.executemany("""insert into personal_note_chunks
                     (note_id, user_id, subject_id, page, chunk_index, content, embedding, embedding_model)
                     values (%s,%s,%s,%s,%s,%s,%s,%s)""", [
@@ -177,7 +190,7 @@ def save_note(data, filename, subject_id, replace, user_id, progress=None):
         if isinstance(error, HTTPException):
             raise
         raise HTTPException(503, "Could not save the note. Your previous note is unchanged.") from None
-    return {"id": str(note_id), "subject_id": subject_id, "title": "My note", "file_type": file_type}
+    return {"id": str(note_id), "subject_id": subject_id, "title": "My note", "file_type": file_type, "failed_pages": failed_pages}
 
 
 def restore_file(bucket, path, data, file_type):
@@ -185,13 +198,13 @@ def restore_file(bucket, path, data, file_type):
     bucket.upload(path, data, file_options={"content-type": content_type, "upsert": "true"})
 
 
-def run_job(job_id, data, filename, subject_id, replace, user_id):
-    def progress(stage, page):
+def run_job(job_id, data, filename, subject_id, replace, user_id, api_key=None):
+    def progress(stage, page, total=None):
         with _jobs_lock:
             if job_id in _jobs:
-                _jobs[job_id].update(stage=stage, page=page, updated=monotonic())
+                _jobs[job_id].update(stage=stage, page=page, total=total, updated=monotonic())
     try:
-        result = save_note(data, filename, subject_id, replace, user_id, progress=progress)
+        result = save_note(data, filename, subject_id, replace, user_id, progress=progress, **({"api_key": api_key} if api_key is not None else {}))
         with _jobs_lock:
             _jobs[job_id].update(stage="ready", result=result, updated=monotonic())
     except Exception as error:
@@ -203,7 +216,7 @@ def run_job(job_id, data, filename, subject_id, replace, user_id):
 @router.post("/jobs", status_code=202)
 async def start_job(background_tasks: BackgroundTasks, file: UploadFile = File(),
                     subject_id: int = Form(gt=0), replace: bool = Form(default=False),
-                    user=Depends(get_current_user)):
+                    user=Depends(get_current_user), api_key=Depends(user_api_key)):
     try:
         data = await file.read(MAX_BYTES + 1)
     finally:
@@ -217,7 +230,7 @@ async def start_job(background_tasks: BackgroundTasks, file: UploadFile = File()
             if _jobs[key]["stage"] in {"ready", "failed"} and now - _jobs[key]["updated"] > JOB_RETENTION:
                 del _jobs[key]
         _jobs[job_id] = {"user_id": str(user["id"]), "stage": "reading", "page": 0, "updated": now}
-    background_tasks.add_task(run_job, job_id, data, file.filename or "", subject_id, replace, user["id"])
+    background_tasks.add_task(run_job, job_id, data, file.filename or "", subject_id, replace, user["id"], api_key)
     return {"id": job_id}
 
 
@@ -232,14 +245,14 @@ def job_status(job_id: str, user=Depends(get_current_user)):
 
 @router.post("")
 async def upload_note(file: UploadFile = File(), subject_id: int = Form(gt=0),
-                      replace: bool = Form(default=False), user=Depends(get_current_user)):
+                      replace: bool = Form(default=False), user=Depends(get_current_user), api_key=Depends(user_api_key)):
     try:
         data = await file.read(MAX_BYTES + 1)
     finally:
         await file.close()
     if len(data) > MAX_BYTES:
         raise HTTPException(413, "Your note must be 20 MB or smaller.")
-    return await run_in_threadpool(save_note, data, file.filename or "", subject_id, replace, user["id"])
+    return await run_in_threadpool(save_note, data, file.filename or "", subject_id, replace, user["id"], **({"api_key": api_key} if api_key is not None else {}))
 
 
 @router.delete("/{subject_id}")

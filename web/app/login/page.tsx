@@ -68,7 +68,7 @@ export default function LoginPage() {
       // Commit the target only after success, preserving the old OTP form on resend failure.
       setSentEmail(normalized);
       setNotice("Code sent. Check your college inbox, including spam.");
-    } catch (error) { setError(errorMessage(error)); }
+    } catch (error) { const message = errorMessage(error); setError(message.startsWith("Cannot reach the backend") ? "The backend may still be starting or is unavailable. Please wait a moment and try again." : message); }
     finally { setBusy(false); }
   }
 
@@ -82,7 +82,7 @@ export default function LoginPage() {
       await signIn(await api.verifyCode(sentEmail, code.trim()));
       setCode("");
       router.replace("/");
-    } catch (error) { setError(errorMessage(error)); }
+    } catch (error) { const message = errorMessage(error); setError(message.startsWith("Cannot reach the backend") ? "The backend may still be starting or is unavailable. Please wait a moment and try again." : message); }
     finally { setBusy(false); }
   }
 

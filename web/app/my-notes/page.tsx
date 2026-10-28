@@ -37,11 +37,16 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { ComingSoon } from "@/components/coming-soon";
 import { api, errorMessage, processNote, type Subject, type PersonalNote } from "@/lib/api";
 import { LoaderCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
 export default function Page() {
+  return <ComingSoon title="My Notes" description="Personal notes will be available in a future update." />;
+}
+
+function PersonalNotes() {
   const [subjects, setSubjects] = useState<Subject[]>([]);
   const [notes, setNotes] = useState<PersonalNote[]>([]);
   const [subjectId, setSubjectId] = useState("");
@@ -64,7 +69,7 @@ export default function Page() {
     const data = new FormData();
     data.set("subject_id", subjectId); data.set("file", file);
     data.set("replace", existing ? "true" : "false");
-    try { await processNote(data, setStage); await load(); setNotice("Your note is ready to search."); setFile(null); }
+    try { const result = await processNote(data, setStage); await load(); setNotice(result?.failed_pages?.length ? `Your note is partly ready. Pages ${result.failed_pages.join(", ")} could not be read and are not searchable.` : "Your note is ready to search."); setFile(null); }
     catch (error) { const message = errorMessage(error); setStage(message.includes("may still") ? "Status unavailable" : "Failed"); setError(message); }
     finally { setBusy(false); }
   }
@@ -76,15 +81,16 @@ export default function Page() {
     finally { setBusy(false); }
   }
   return <div className="mx-auto max-w-2xl space-y-6"><h1 className="font-heading text-3xl font-semibold">My notes</h1>
-    <p className="text-sm text-muted-foreground">One private note per subject. Upload a scanned PDF, PNG or JPEG, up to 20 MB and 30 PDF pages.</p>
+    <p className="text-sm text-muted-foreground">One private note per subject. Upload a scanned PDF, PNG or JPEG, up to 20 MB and 30 PDF pages. Your file is sent to Google Gemini for OCR.</p>
     {error && <p role="alert" className="rounded-lg bg-red-50 p-3 text-red-800">{error}</p>}
     {notice && <p role="status" className="rounded-lg bg-green-50 p-3">{notice}</p>}
     <form onSubmit={upload} className="space-y-4 rounded-xl border bg-white p-6"><label htmlFor="note-subject">Subject</label>
       <select id="note-subject" value={subjectId} required onChange={event => setSubjectId(event.target.value)} disabled={busy}><option value="" disabled>Choose a subject</option>{subjects.map(subject => <option key={subject.id} value={subject.id}>{subject.code} - {subject.name}</option>)}</select>
+      {existing?.failed_pages?.length ? <p role="alert" className="rounded-lg bg-amber-50 p-3">Pages {existing.failed_pages.join(", ")} could not be read and are not searchable. Uploading a file replaces the whole note.</p> : null}
       {subjectId && <p className="font-semibold">Selected: {subjects.find(subject => String(subject.id) === subjectId)?.name} ({subjects.find(subject => String(subject.id) === subjectId)?.code})</p>}
       <p className="text-sm">{existing ? "You already have a note for this subject. Uploading will replace it." : "No note uploaded for this subject."}</p>
       <label htmlFor="note-file" className="block text-sm font-medium">Choose your file</label><input id="note-file" type="file" className="block w-full text-sm file:mr-3 file:rounded-lg file:border file:px-4 file:py-2 file:font-medium" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" onChange={event => setFile(event.target.files?.[0] || null)} disabled={busy} required />
       <div className="flex gap-3"><Button disabled={busy || !file || !subjectId} type="submit">{busy ? "Processing..." : existing ? "Replace note" : "Upload note"}</Button>{existing && <Button disabled={busy} type="button" variant="outline" onClick={() => void remove()}>Delete</Button>}</div>
-    </form>{stage && <p role="status" className="flex items-center gap-2 text-sm">{busy && <LoaderCircle className="animate-spin" size={18} />}{stage}</p>}<p className="text-xs text-muted-foreground">OCR runs locally and can make mistakes. Your note is included when you ask about this subject.</p>
+    </form>{stage && <p role="status" className="flex items-center gap-2 text-sm">{busy && <LoaderCircle className="animate-spin" size={18} />}{stage}</p>}<p className="text-xs text-muted-foreground">OCR can make mistakes. Check your original note when accuracy matters. Your note is included when you ask about this subject.</p>
   </div>;
 }
