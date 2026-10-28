@@ -14,6 +14,12 @@ import pytest
 from app import db
 from app.ingest import pdf_loader, pipeline
 from scripts import ingest_pdf as cli
+from io import BytesIO
+from zipfile import BadZipFile
+from pptx import Presentation
+from pptx.util import Inches
+from app.ingest import pptx_loader
+from app.ingest.chunker import chunk_pages
 
 
 def test_loader_preserves_original_pages_and_counts_short_text(tmp_path, monkeypatch):
@@ -40,6 +46,7 @@ def test_real_blank_pdf_counts_every_page_as_skipped(tmp_path):
 
 @pytest.fixture
 def ingestion(monkeypatch):
+    monkeypatch.setattr(pipeline, "extract_figures", lambda *args: [])
     monkeypatch.setattr(pipeline, "Settings", lambda: SimpleNamespace(embedding_model="test-model"))
     monkeypatch.setattr(pipeline, "load_pdf_pages", lambda path: ([{"page": 2, "text": "notes"}], 1))
     chunks = [{"page": 2, "chunk_index": i, "content": f"chunk {i}"} for i in range(65)]
@@ -99,7 +106,7 @@ def test_replace_deletes_old_document_in_same_transaction(ingestion):
 def test_chunk_insert_failure_exits_transaction_with_error(ingestion, capsys):
     ingestion.cursor.fetchone.side_effect = [(1, 2), (ingestion.document_id,), (ingestion.document_id,)]
     ingestion.cursor.executemany.side_effect = RuntimeError("dummy failure")
-    with pytest.raises(RuntimeError):
+    with pytest.raises(pipeline.IngestError, match="save document text"):
         pipeline.ingest_pdf("dummy.pdf", "OS", 2, "Memory", replace=True)
     assert ingestion.context.return_value.__exit__.call_args.args[0] is RuntimeError
     assert "chunks stored:" not in capsys.readouterr().out
@@ -107,7 +114,7 @@ def test_chunk_insert_failure_exits_transaction_with_error(ingestion, capsys):
 
 def test_third_embedding_batch_failure_opens_no_database_transaction(ingestion):
     ingestion.embed.side_effect = [[[0.0] * 768] * 32, [[0.0] * 768] * 32, RuntimeError("dummy failure")]
-    with pytest.raises(RuntimeError):
+    with pytest.raises(pipeline.IngestError, match="Text embedding failed.*RuntimeError"):
         pipeline.ingest_pdf("dummy.pdf", "OS", 2, "Memory")
     ingestion.context.assert_not_called()
 
@@ -174,8 +181,9 @@ def test_existing_document_ingestion_reuses_row_and_marks_ready(ingestion):
     assert not any("insert into documents" in call.args[0] for call in calls)
     assert calls[1].args[1] == (result, 1, 2, "official")
     assert "status = 'processing'" in calls[1].args[0]
-    assert "status = 'ready'" in calls[-1].args[0]
-    assert calls[-1].args[1] == (2, result)
+    assert "status = 'ready'" in calls[-2].args[0]
+    assert calls[-1].args == ("delete from answer_cache where subject_id = %s", (1,))
+    assert calls[-2].args[1] == (2, result)
     assert ingestion.cursor.executemany.call_args.args[1][0][0] == result
     ingestion.context.return_value.__exit__.assert_called_once_with(None, None, None)
 
@@ -192,7 +200,7 @@ def test_existing_document_scope_mismatch_prevents_chunk_writes(ingestion):
 def test_existing_document_chunk_failure_rolls_back_without_ready(ingestion):
     ingestion.cursor.fetchone.side_effect = [(1, 2), (ingestion.document_id,)]
     ingestion.cursor.executemany.side_effect = RuntimeError("dummy failure")
-    with pytest.raises(RuntimeError):
+    with pytest.raises(pipeline.IngestError, match="save document text"):
         pipeline.ingest_pdf(
             b"dummy PDF bytes", "OS", 2, "Memory", document_id=ingestion.document_id
         )
@@ -215,3 +223,376 @@ def test_cli_keeps_path_based_ingestion(monkeypatch, capsys):
     assert ingest.call_args.args[1:] == ("OS", 2, "Memory")
     assert ingest.call_args.kwargs == {"replace": True}
     assert "PASS ingestion" in capsys.readouterr().out
+
+
+def sample_pptx():
+    presentation = Presentation()
+    first = presentation.slides.add_slide(presentation.slide_layouts[6])
+    first.shapes.add_textbox(Inches(1), Inches(1), Inches(5), Inches(1)).text = "Paging"
+    first.notes_slide.notes_text_frame.text = "The speaker explains how virtual pages map to physical frames."
+    presentation.slides.add_slide(presentation.slide_layouts[6])
+    third = presentation.slides.add_slide(presentation.slide_layouts[6])
+    third.notes_slide.notes_text_frame.text = "These speaker notes are the only text on slide three."
+    output = BytesIO()
+    presentation.save(output)
+    return output.getvalue()
+
+
+def test_pptx_extracts_short_titles_and_speaker_notes_without_renumbering():
+    pages, skipped = pptx_loader.load_pptx_pages(sample_pptx())
+    assert [page["page"] for page in pages] == [1, 3]
+    assert skipped == 1
+    assert pages[0]["text"].startswith("Paging\n\nSpeaker notes:\n")
+    assert "physical frames" in pages[0]["text"]
+    assert "only text on slide three" in pages[1]["text"]
+
+
+def test_pptx_supports_paths_and_keeps_chunk_slide_numbers(tmp_path):
+    source = tmp_path / "lecture.pptx"
+    source.write_bytes(sample_pptx())
+    pages, skipped = pptx_loader.load_pptx_pages(source)
+    chunks = chunk_pages(pages)
+    assert [chunk["page"] for chunk in chunks] == [1, 3]
+    assert skipped == 1
+
+
+def test_pptx_extracts_grouped_text_and_tables():
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+    group = slide.shapes.add_group_shape()
+    group.shapes.add_textbox(Inches(1), Inches(1), Inches(2), Inches(1)).text = "Grouped lecture text"
+    table = slide.shapes.add_table(2, 2, Inches(1), Inches(3), Inches(5), Inches(2)).table
+    table.cell(0, 0).text = "Page"
+    table.cell(0, 1).text = "Frame"
+    table.cell(1, 0).text = "Virtual"
+    table.cell(1, 1).text = "Physical"
+    output = BytesIO()
+    presentation.save(output)
+    pages, skipped = pptx_loader.load_pptx_pages(output.getvalue())
+    assert skipped == 0
+    assert "Grouped lecture text" in pages[0]["text"]
+    assert "Page | Frame\nVirtual | Physical" in pages[0]["text"]
+
+
+def test_pptx_parser_does_not_create_missing_notes_slides(monkeypatch):
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+    assert not slide.has_notes_slide
+    monkeypatch.setattr(pptx_loader, "Presentation", lambda stream: presentation)
+    with pytest.raises(pptx_loader.NoReadableSlidesError, match="No readable text found in slides"):
+        pptx_loader.load_pptx_pages(b"fake")
+    assert not slide.has_notes_slide
+
+
+def test_pptx_handles_missing_notes_placeholder(monkeypatch):
+    slide = SimpleNamespace(shapes=[], has_notes_slide=True,
+                            notes_slide=SimpleNamespace(notes_text_frame=None))
+    monkeypatch.setattr(pptx_loader, "Presentation", lambda stream: SimpleNamespace(slides=[slide]))
+    with pytest.raises(pptx_loader.NoReadableSlidesError, match="No readable text found in slides"):
+        pptx_loader.load_pptx_pages(b"fake")
+
+
+def test_pptx_rejects_corrupt_presentation():
+    with pytest.raises(BadZipFile):
+        pptx_loader.load_pptx_pages(b"PK this is not a valid PowerPoint archive")
+
+
+def test_pptx_uses_shared_chunk_embedding_and_storage_pipeline(ingestion, monkeypatch):
+    monkeypatch.setattr(pipeline, "chunk_pages", chunk_pages)
+    result = pipeline.ingest_document(sample_pptx(), "OS", 2, "Lecture", file_type="pptx")
+    assert result == ingestion.document_id
+    rows = ingestion.cursor.executemany.call_args.args[1]
+    assert [row[4] for row in rows] == [1, 3]
+    assert "physical frames" in rows[0][6]
+    assert "only text on slide three" in rows[1][6]
+    assert all(row[7].dimensions() == 768 for row in rows)
+    assert ingestion.embed.call_count == 1
+    assert any(call.args[1] == (3, result) for call in ingestion.cursor.execute.call_args_list
+               if "status = 'ready'" in call.args[0])
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("  First\x0b  second  ", "First\nsecond"),
+    ("A\x00B\x1bC\x7fD\x85E\tF", "A B C D E F"),
+    ("A\r\n B\rC\x0cD", "A\nB\nC\nD"),
+    (" \x00\x0b\t\x1b\u200b ", ""),
+    (" \u03b1   +  \u03b2  \n\n\n  equals \u03b3 ", "\u03b1 + \u03b2\n\nequals \u03b3"),
+])
+def test_pptx_cleans_controls_and_whitespace(text, expected):
+    assert pptx_loader.clean_slide_text(text) == expected
+
+
+def deck_with_soft_breaks():
+    presentation = Presentation()
+    for number in range(1, 24):
+        slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+        if number in {1, 23}:
+            slide.shapes.add_textbox(Inches(1), Inches(1), Inches(5), Inches(1)).text = "  Virtual memory\x0b  uses   pages  "
+        elif number == 7:
+            slide.notes_slide.notes_text_frame.text = "  Speaker\x0b notes    about page tables  "
+        elif number == 5:
+            slide.shapes.add_textbox(Inches(1), Inches(1), Inches(5), Inches(1)).text = "  \x0b  \t "
+        elif number == 10:
+            slide.shapes.add_table(2, 2, Inches(1), Inches(1), Inches(4), Inches(2))
+    output = BytesIO()
+    presentation.save(output)
+    return output.getvalue()
+
+
+def test_23_slide_deck_skips_empty_slides_cleans_soft_breaks_and_keeps_citations():
+    from app.rag.prompt import build_context
+    pages, skipped = pptx_loader.load_pptx_pages(deck_with_soft_breaks())
+    assert skipped == 20
+    assert [page["page"] for page in pages] == [1, 7, 23]
+    assert pages[0]["text"] == "Virtual memory\nuses pages"
+    assert pages[1]["text"] == "Speaker notes:\nSpeaker\nnotes about page tables"
+    assert all("\x0b" not in page["text"] and "\x00" not in page["text"] for page in pages)
+    context = build_context([
+        {"subject": "OS", "module": 2, "document": "Lecture", "file_type": "pptx",
+         "page": page["page"], "content": page["text"]} for page in pages
+    ])
+    for number in (1, 7, 23):
+        assert f"Slide {number})" in context
+
+
+@pytest.mark.parametrize("count", [0, 1, 23])
+def test_all_empty_pptx_returns_clear_error(count):
+    presentation = Presentation()
+    for _ in range(count):
+        slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+        slide.shapes.add_textbox(Inches(1), Inches(1), Inches(5), Inches(1)).text = "  \x0b \t "
+        slide.notes_slide.notes_text_frame.text = " \x0b "
+    output = BytesIO()
+    presentation.save(output)
+    with pytest.raises(pptx_loader.NoReadableSlidesError, match="^No readable text found in slides$"):
+        pptx_loader.load_pptx_pages(output.getvalue())
+
+
+def test_empty_deck_pipeline_stops_before_embeddings_and_database(ingestion, monkeypatch, caplog):
+    def no_text(path):
+        raise pptx_loader.NoReadableSlidesError(pptx_loader.NO_READABLE_SLIDES)
+    monkeypatch.setattr(pipeline, "load_pptx_pages", no_text)
+    with pytest.raises(pipeline.IngestError, match="^No readable text found in slides$") as error:
+        pipeline.ingest_document(b"fake", "OS", 2, "Lecture", file_type="pptx")
+    assert error.value.safe_reason == "No readable text found in slides"
+    ingestion.embed.assert_not_called()
+    ingestion.context.assert_not_called()
+    assert "Traceback (most recent call last)" in caplog.text
+    assert "NoReadableSlidesError" in caplog.text
+
+
+def test_pipeline_logs_real_stack_without_exception_messages_or_secrets(ingestion, caplog):
+    ingestion.embed.side_effect = RuntimeError(
+        "fake-private-key https://private.invalid?token=fake-token "
+        "postgresql://user:fake-password@private/db Authorization: Bearer fake-access"
+    )
+    with pytest.raises(pipeline.IngestError, match="Text embedding failed.*RuntimeError") as error:
+        pipeline.ingest_document(b"fake", "OS", 2, "Lecture")
+    assert isinstance(error.value.__cause__, RuntimeError)
+    assert "RuntimeError" in caplog.text
+    assert "pipeline.py" in caplog.text
+    assert "Traceback (most recent call last)" in caplog.text
+    for value in ("fake-private-key", "fake-token", "fake-password", "fake-access", "https://", "postgresql://"):
+        assert value not in caplog.text
+        assert value not in str(error.value)
+
+
+def test_embedding_failure_logs_original_chunk_index_without_document_text(ingestion, caplog, monkeypatch):
+    from app.embeddings import EmbeddingError
+    monkeypatch.setattr(pipeline, "load_pptx_pages", lambda path: ([{"page": 2, "text": "notes"}], 1))
+    text = "pages map to physical frames " * 5 + "outside preview"
+    ingestion.chunks[33]["content"] = text
+    ingestion.embed.side_effect = [
+        [[0.0] * 768] * 32,
+        EmbeddingError("Text embedding incorrectly entered video preprocessing (ImportError).", chunk_index=1),
+    ]
+    with pytest.raises(pipeline.IngestError, match="Chunk 33:.*video preprocessing.*ImportError") as error:
+        pipeline.ingest_document(b"fake", "OS", 2, "Lecture", file_type="pptx")
+    assert error.value.safe_reason.startswith("Chunk 33:")
+    assert "pages map to physical frames" not in caplog.text
+    assert "outside preview" not in caplog.text
+    ingestion.context.assert_not_called()
+
+
+def test_pipeline_skips_empty_chunks_before_embedding_without_losing_alignment(ingestion):
+    ingestion.chunks[1]["content"] = " \n "
+    pipeline.ingest_document(b"fake", "OS", 2, "Lecture")
+    rows = ingestion.cursor.executemany.call_args.args[1]
+    assert len(rows) == 64
+    assert rows[0][5:7] == (0, "chunk 0")
+    assert rows[1][5:7] == (2, "chunk 2")
+    assert [len(call.args[0]) for call in ingestion.embed.call_args_list] == [32, 32]
+
+
+def test_chunk_preview_masks_secrets_before_truncating():
+    from app.logging_safety import safe_chunk_preview
+    assert safe_chunk_preview("pages " * 30 + "token=fake-private-value") == "[redacted: potentially sensitive text]"
+    assert "private" not in safe_chunk_preview("See https://private.invalid/path for details")
+    assert "PRIVATE" not in safe_chunk_preview("See HTTPS://PRIVATE.INVALID/path for details")
+
+
+def test_figure_captions_are_embedded_as_text_and_saved_with_image(ingestion, monkeypatch):
+    figure = {"page": 2, "data": b"fake-image-bytes"}
+    monkeypatch.setattr(pipeline, "extract_figures", lambda *args: [figure])
+    monkeypatch.setattr(pipeline, "describe_figure", lambda data: "The diagram shows a page table.")
+    pipeline.ingest_pdf("dummy.pdf", "OS", 2, "Memory")
+    all_texts = [item for call in ingestion.embed.call_args_list for item in call.args[0]]
+    assert all(isinstance(item, str) for item in all_texts)
+    assert any("page table" in item for item in all_texts)
+    figure_insert = next(call for call in ingestion.cursor.execute.call_args_list if "insert into course_figures" in call.args[0])
+    assert figure_insert.args[1][-1] == b"fake-image-bytes"
+    assert any("figure_id" in call.args[0] for call in ingestion.cursor.execute.call_args_list)
+
+
+def test_extract_pptx_picture_and_skip_small_icon():
+    from PIL import Image
+    from app.ingest.figures import extract_figures
+    def image(size):
+        output = BytesIO()
+        Image.new("RGB", size, "white").save(output, format="PNG")
+        output.seek(0)
+        return output
+    deck = Presentation()
+    slide = deck.slides.add_slide(deck.slide_layouts[6])
+    slide.shapes.add_picture(image((300, 300)), Inches(1), Inches(1))
+    slide.shapes.add_picture(image((20, 20)), Inches(2), Inches(2))
+    output = BytesIO()
+    deck.save(output)
+    figures = extract_figures(output.getvalue(), "pptx")
+    assert len(figures) == 1
+    assert figures[0]["page"] == 1
+    assert figures[0]["data"].startswith(b"\xff\xd8")
+
+
+def test_gemini_ocr_rejects_repetition_before_indexing(monkeypatch):
+    from app import ocr
+    from types import SimpleNamespace
+    monkeypatch.setattr(ocr, "Settings", lambda: SimpleNamespace(ocr_model="gemini-3.5-flash-lite", google_api_key="dummy"))
+    class Response:
+        status_code = 200
+        def raise_for_status(self):
+            pass
+        def json(self):
+            import json
+            return {"candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": json.dumps({"pages": [{"page": 1, "text": "1." * 100}]})}]}}]}
+    monkeypatch.setattr(ocr.httpx, "post", lambda *args, **kwargs: Response())
+    with pytest.raises(ocr.OCRFailure, match="pages 1"):
+        ocr.transcribe(b"image", ".png")
+
+
+def test_ocr_comparison_word_error_rate():
+    from scripts.compare_ocr import word_error_rate
+    assert word_error_rate("Application Software", "application hardware") == 0.5
+
+
+def test_gemini_ocr_uses_request_key_and_preserves_pages(monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from app import ocr
+    monkeypatch.setattr(ocr, "Settings", lambda: SimpleNamespace(ocr_model="gemini-3.5-flash-lite", google_api_key="server"))
+    calls = []
+    class Response:
+        status_code = 200
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": json.dumps({"pages": [{"page": 1, "text": "Application software"}]})}]}}]}
+    def post(url, **kwargs):
+        calls.append(kwargs)
+        return Response()
+    monkeypatch.setattr(ocr.httpx, "post", post)
+    assert ocr.transcribe(b"image", ".png", api_key="student") == [{"page": 1, "text": "Application software"}]
+    assert calls[0]["headers"]["x-goog-api-key"] == "student"
+
+
+def test_gemini_ocr_limits_rate_limit_retries(monkeypatch):
+    from types import SimpleNamespace
+    from app import ocr
+    monkeypatch.setattr(ocr, "Settings", lambda: SimpleNamespace(ocr_model="gemini-3.5-flash-lite", google_api_key="server"))
+    calls = []
+    monkeypatch.setattr(ocr.httpx, "post", lambda *args, **kwargs: calls.append(1) or SimpleNamespace(status_code=429))
+    monkeypatch.setattr(ocr.time, "sleep", lambda seconds: None)
+    with pytest.raises(ocr.OCRFailure, match="quota.*pages 1"):
+        ocr.transcribe(b"image", ".png")
+    assert len(calls) == 3
+
+
+def test_ocr_preserves_good_pages_after_batch_failure(monkeypatch, caplog):
+    from io import BytesIO
+    from types import SimpleNamespace
+    from pypdf import PdfWriter
+    from app import ocr
+    writer = PdfWriter()
+    for _ in range(3):
+        writer.add_blank_page(width=100, height=100)
+    data = BytesIO()
+    writer.write(data)
+    monkeypatch.setattr(ocr, "Settings", lambda: SimpleNamespace(ocr_model="test", google_api_key="secret"))
+    monkeypatch.setattr(ocr.time, "sleep", lambda _: None)
+    def read(data, mime, numbers, model, key):
+        if len(numbers) > 1 or numbers == [2]:
+            return None, "timeout"
+        return [{"page": numbers[0], "text": "valid"}], None
+    monkeypatch.setattr(ocr, "read_batch", read)
+    pages = ocr.transcribe(data.getvalue(), ".pdf")
+    assert [page["page"] for page in pages] == [1, 3]
+    assert pages.failed_pages == [2]
+    assert "timeout" in caplog.text
+    assert "secret" not in caplog.text
+    assert "valid" not in caplog.text
+
+
+def test_ocr_repetition_check_accepts_structured_content():
+    from app.ocr import suspicious
+    assert not suspicious("\n".join(f"{i}. item {i} = value" for i in range(1, 80)))
+    assert not suspicious("\n".join(f"row {i} | 0 | 0 | 0" for i in range(80)))
+    assert not suspicious("\n".join(f"    print({i})" for i in range(80)))
+    assert suspicious("abcd" * 100)
+
+
+def test_progress_reports_each_completed_embedding_batch(ingestion):
+    updates = []
+    pipeline.ingest_document("dummy.pdf", "OS", 2, "Memory", progress=lambda done, total: updates.append((done, total)))
+    assert updates == [(0, 65), (32, 65), (64, 65), (65, 65)]
+
+
+def test_repeated_figures_are_described_once(ingestion, monkeypatch):
+    from unittest.mock import MagicMock
+    figures = [{"page": 1, "data": b"same"}, {"page": 2, "data": b"same"}]
+    describe = MagicMock(return_value="A diagram")
+    monkeypatch.setattr(pipeline, "extract_figures", lambda *args: figures)
+    monkeypatch.setattr(pipeline, "describe_figure", describe)
+    pipeline.ingest_document("dummy.pdf", "OS", 2, "Memory")
+    describe.assert_called_once_with(b"same")
+    assert figures[0]["id"] != figures[1]["id"]
+
+
+def test_reembed_updates_official_and_clears_subject_cache(monkeypatch):
+    from scripts import reembed_all
+    from unittest.mock import MagicMock
+    connection = MagicMock()
+    cursor = connection.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = (1,)
+    cursor.fetchall.side_effect = [[(12, 3, "private")], []]
+    cursor.rowcount = 1
+    monkeypatch.setattr(reembed_all, "get_conn", connection)
+    monkeypatch.setattr(reembed_all, "embed_documents", lambda texts: [[0.0] * 768])
+    invalidate = MagicMock()
+    monkeypatch.setattr(reembed_all, "invalidate_scope", invalidate)
+    assert reembed_all.migrate_table("chunks", "gemini-embedding-2") == 1
+    invalidate.assert_called_once_with(3, cursor)
+    update = next(call for call in cursor.execute.call_args_list if call.args[0].startswith("update chunks"))
+    assert update.args[1][1:3] == ("gemini-embedding-2", 12)
+
+
+def test_reembed_dry_run_never_calls_gemini(monkeypatch):
+    from scripts import reembed_all
+    from unittest.mock import MagicMock
+    connection = MagicMock()
+    cursor = connection.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = (4,)
+    embed = MagicMock()
+    monkeypatch.setattr(reembed_all, "get_conn", connection)
+    monkeypatch.setattr(reembed_all, "embed_documents", embed)
+    assert reembed_all.migrate_table("personal_note_chunks", "gemini-embedding-2", True) == 0
+    embed.assert_not_called()

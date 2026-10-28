@@ -1,0 +1,69 @@
+/**
+ * Define the navy, cream, and gold portal design tokens.
+ * Tailwind and the shadcn/ui controls consume these shared values.
+ * This module belongs to the Phase 6 browser frontend.
+ * Next.js App Router supplies navigation.
+ * TypeScript makes request shapes explicit.
+ * Tailwind supplies the styling utilities.
+ * Shared controls follow shadcn/ui conventions.
+ * Navy and cream identify the learning portal.
+ * Gold accents highlight useful actions.
+ * Small functions keep the flow readable.
+ * Application requests go only to FastAPI.
+ * The public API URL comes from the process environment.
+ * Database operations remain on the backend.
+ * Supabase authentication remains on the backend.
+ * Backend permissions remain authoritative.
+ * Tokens are held only in browser memory.
+ * User API keys are held only in browser memory.
+ * Refreshing the tab clears the current session.
+ * Logging out clears private session data.
+ * No credentials are written to disk.
+ * No credentials are written to URLs.
+ * No credentials are written to logs.
+ * HTTP errors use safe user-facing messages.
+ * Requests with credentials are never cached.
+ * Question scope uses backend database IDs.
+ * Sources remain attached to their answers.
+ * Chat histories are separated by subject.
+ * Daily allowance is supplied by the backend.
+ * Uploads reuse the existing PDF endpoint.
+ * Ingestion status is polled until completion.
+ * Later-phase features remain placeholders.
+ * Layout adapts to small mobile screens.
+ * Live integrations require manual verification.
+ */
+
+@import "tailwindcss";
+
+@theme inline {
+  --color-background: #F5F0E6;
+  --color-foreground: #24364b;
+  --color-card: #ffffff;
+  --color-card-foreground: #24364b;
+  --color-primary: #1E3A5F;
+  --color-primary-foreground: #ffffff;
+  --color-muted: #eeeadf;
+  --color-muted-foreground: #657183;
+  --color-accent: #ece7db;
+  --color-accent-foreground: #1E3A5F;
+  --color-border: #e5dfd3;
+  --color-input: #d8d5cd;
+  --color-ring: #C9A227;
+  --color-gold: #C9A227;
+  --font-sans: var(--font-inter), Arial, sans-serif;
+  --font-heading: var(--font-playfair), Georgia, serif;
+}
+:root { color-scheme: light; }
+body { background: #F5F0E6; color: #24364b; font-family: var(--font-inter), Arial, sans-serif; }
+h1, h2, h3 { text-wrap: balance; }
+button, summary, a { -webkit-tap-highlight-color: transparent; }
+button:not(:disabled), summary { cursor: pointer; }
+select { min-height: 2.75rem; width: 100%; border: 1px solid #d8d5cd; border-radius: .5rem; padding: .65rem 2rem .65rem .75rem; background: white; font-size: .875rem; }
+select:focus-visible, textarea:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px solid #C9A227; outline-offset: 3px; }
+label { font-size: .875rem; font-weight: 500; }
+.course-cover { position: relative; overflow: hidden; }
+.course-cover::before { content: ""; position: absolute; width: 190px; height: 190px; border: 1px solid #ffffff20; border-radius: 50%; right: -35px; top: -70px; }
+.course-cover::after { content: ""; position: absolute; width: 130px; height: 130px; border: 1px solid #ffffff20; border-radius: 50%; right: 35px; bottom: -80px; }
+::selection { background: #C9A22740; }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; } }

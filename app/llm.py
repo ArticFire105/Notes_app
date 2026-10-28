@@ -1,7 +1,7 @@
 """
-Create the Phase 2 Gemini chat model using existing settings.
+Create the Gemini chat model using existing settings.
 The default key comes from the backend configuration.
-An explicit key override reserves the boundary for later BYOK work.
+An explicit request-only key override supports Phase 5 BYOK.
 Quiet library calls prevent third-party diagnostics exposing credentials.
 
 This file belongs only to Phase 2 of the notes application.
@@ -21,8 +21,8 @@ An unsupported question must produce the not-found response.
 Empty retrieval must not trigger a paid chat request.
 Chat output is limited through the existing settings class.
 Usage counts are returned for later accounting work.
-No quota or cache behavior is introduced in this phase.
-No authentication or frontend behavior is introduced here.
+The router handles quotas and caches around answer generation.
+Provider errors become fixed messages without secret diagnostics.
 Real credentials belong only in the user's local configuration.
 Secrets must never appear in printed exception diagnostics.
 Offline tests replace settings and external service calls.
@@ -39,6 +39,8 @@ import logging
 import os
 
 from langchain.chat_models import init_chat_model
+from fastapi import HTTPException, Request
+from pydantic import SecretStr
 
 from app.config import Settings
 
@@ -59,6 +61,8 @@ def quiet_chat_output():
 def get_chat_model(api_key=None):
     settings = Settings()
     key = settings.google_api_key.get_secret_value() if api_key is None else api_key
+    if isinstance(key, SecretStr):
+        key = key.get_secret_value()
     with quiet_chat_output():
         return init_chat_model(
             settings.chat_model,
@@ -66,4 +70,35 @@ def get_chat_model(api_key=None):
             temperature=0.2,
             max_output_tokens=settings.max_output_tokens,
         )
+
+
+def user_api_key(request: Request):
+    value = request.headers.get("X-User-Api-Key")
+    if value is None:
+        return None
+    if not value.strip():
+        raise HTTPException(400, "Provide a nonempty Google AI Studio key.")
+    return SecretStr(value.strip())
+
+
+@contextmanager
+def provider_errors():
+    try:
+        with quiet_chat_output():
+            yield
+    except Exception:
+        # Provider exception strings may contain the supplied key. Use a fixed
+        # message for quota, billing, authentication, and transport failures.
+        raise HTTPException(
+            503, "Gemini is busy or the limit was reached; try later or use your own key."
+        ) from None
+
+
+def test_user_key(api_key):
+    if api_key is None:
+        raise HTTPException(400, "Provide your Google AI Studio key in X-User-Api-Key.")
+    with provider_errors():
+        model = get_chat_model(api_key)
+        model.bind(max_output_tokens=8).invoke("Reply OK.")
+    return {"ok": True}
 

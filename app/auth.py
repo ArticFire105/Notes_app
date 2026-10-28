@@ -40,7 +40,7 @@ import base64
 import hashlib
 import json
 from threading import Lock
-from time import time
+from time import time, monotonic
 
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -55,6 +55,29 @@ _identity_cache = {}
 _cache_lock = Lock()
 CACHE_SECONDS = 60
 MAX_CACHE_ENTRIES = 256
+_rate_lock = Lock()
+_rate_events = {}
+RATE_LIMITS = {"upload": (10, 3600), "worksheet": (30, 3600), "chat": (30, 60)}
+
+
+def check_rate_limit(user_id, category):
+    limit, window = RATE_LIMITS[category]
+    now = monotonic()
+    with _rate_lock:
+        # Drop expired entries so idle accounts do not accumulate indefinitely.
+        for key, events in list(_rate_events.items()):
+            remaining = [event for event in events if now - event < RATE_LIMITS[key[1]][1]]
+            if remaining:
+                _rate_events[key] = remaining
+            else:
+                del _rate_events[key]
+        key = (str(user_id), category)
+        events = _rate_events.setdefault(key, [])
+        if len(events) >= limit:
+            retry = max(1, int(window - (now - events[0])) + 1)
+            raise HTTPException(429, f"Too many {category} requests. Please try again later.",
+                                headers={"Retry-After": str(retry)})
+        events.append(now)
 
 
 def is_allowed_email(email: str, domain: str) -> bool:

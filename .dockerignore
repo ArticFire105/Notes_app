@@ -1,0 +1,45 @@
+# Restrict the build context to backend source and dependency metadata.
+# Azure builds must not receive local data or evaluation files.
+# The default exclusion also protects future files.
+# Only the entries below are needed by the Dockerfile.
+# Real environment files are excluded by the default.
+# Git metadata is excluded by the default.
+# Test fixtures are excluded by the default.
+# Frontend files are excluded by the default.
+# Model caches are excluded by the default.
+# Local Python environments are excluded by the default.
+# Downloaded tooling is excluded by the default.
+# Documents are excluded by the default.
+# Build outputs are excluded by the default.
+# Logs are excluded by the default.
+# The lockfile fixes dependency versions.
+# The project metadata supplies dependency declarations.
+# The README is referenced by project metadata.
+# The app directory contains FastAPI application code.
+# Its package subdirectories are included recursively.
+# The Dockerfile itself is handled by Docker.
+# This allowlist applies only to the image build context.
+# It does not replace Git ignore rules.
+# It does not grant access to Azure secrets.
+# Azure injects configuration at runtime.
+# Supabase remains the durable data store.
+# No uploads should be stored in the image.
+# No credentials should be stored in the image.
+# Keep this list narrow when adding files.
+# Review new backend files before adding exceptions.
+# Local scripts are not part of the runtime.
+# Database migrations are applied separately.
+# The frontend is built separately on Vercel.
+# Run builds from the repository root.
+# This file cannot remove historical Git commits.
+# Check Git history separately before publishing.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!app/
+!app/**/
+!app/**/*.py
+**/.env*
+**/__pycache__/
+**/*.pyc

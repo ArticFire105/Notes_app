@@ -53,7 +53,6 @@ def settings(monkeypatch):
         "supabase_anon_key": "dummy-anon-key",
         "supabase_service_role_key": "dummy-service-key",
         "google_api_key": "dummy-google-key",
-        "hf_token": "dummy-hf-token",
     }
     for name in (*values, "embedding_provider", "embedding_model", "embedding_dim", "chat_model"):
         monkeypatch.delenv(name.upper(), raising=False)
@@ -64,7 +63,7 @@ def settings(monkeypatch):
 def test_settings_hide_credentials(settings):
     for field in (
         "database_url", "supabase_anon_key", "supabase_service_role_key",
-        "google_api_key", "hf_token",
+        "google_api_key",
     ):
         assert getattr(settings, field).get_secret_value() not in repr(settings)
         assert getattr(settings, field).get_secret_value() not in settings.model_dump_json()
@@ -126,10 +125,10 @@ def test_database_failure_hides_exception(settings, monkeypatch, capsys):
 @pytest.mark.parametrize("dimension,expected", [(768, True), (512, False)])
 def test_embedding_dimension(settings, monkeypatch, dimension, expected):
     model = MagicMock()
-    model.return_value.encode.return_value = [0.0] * dimension
-    monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=model))
+    model.return_value.embed_query.return_value = [0.0] * dimension
+    monkeypatch.setattr("app.embeddings.GeminiEmbedder", model)
     assert check_setup.check_embedding(settings) is expected
-    model.assert_called_once_with(settings.embedding_model, token="dummy-hf-token")
+    model.assert_called_once_with(settings)
 
 
 def test_embedding_failure_hides_library_output(settings, monkeypatch, capsys):
@@ -137,7 +136,7 @@ def test_embedding_failure_hides_library_output(settings, monkeypatch, capsys):
         print("dummy-hf-token", file=sys.stderr)
         raise RuntimeError("dummy-hf-token")
 
-    monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=failing_model))
+    monkeypatch.setattr("app.embeddings.GeminiEmbedder", failing_model)
     assert check_setup.check_embedding(settings) is False
     captured = capsys.readouterr()
     assert "FAIL embeddings" in captured.out

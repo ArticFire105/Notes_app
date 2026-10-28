@@ -1,0 +1,73 @@
+# Build and deploy the FastAPI backend after a push to main.
+# The Vercel frontend has its own deployment integration.
+# This workflow builds only the backend Docker image.
+# The Docker context allowlist excludes private files.
+# No application secrets are passed to the image build.
+# GitHub Container Registry stores the finished image.
+# Each commit gets a unique image tag.
+# Azure Container Apps pulls that immutable tag.
+# The existing Container App supplies its runtime secrets.
+# The app and registry must exist before this workflow runs.
+# The GHCR package must be public for anonymous pulls.
+# Azure access uses GitHub's short-lived OIDC identity.
+# Configure a federated credential for the main branch.
+# The Azure identity needs access to the Container App.
+# Azure client, tenant and subscription IDs are GitHub secrets.
+# Resource group and Container App names are GitHub variables.
+# No Azure client secret is stored in GitHub.
+# The GitHub token can publish only within its permissions.
+# No access token is written to application logs.
+# Azure CLI changes the deployed image only.
+# Existing environment variables remain on the Container App.
+# Existing ingress and scaling settings remain unchanged.
+# The app should use a single active replica for its queue.
+# A new revision can interrupt in-process background work.
+# Restart recovery must be configured before production use.
+# A failed image build cannot deploy a new revision.
+# A failed deployment leaves the preceding revision available.
+# GitHub displays the build and deploy status under Actions.
+# Run tests before merging changes to main.
+# This workflow does not run database migrations.
+# Apply migrations manually before deploying dependent code.
+# Configure the Azure custom domain separately.
+# Configure the frontend domain separately in Vercel.
+# Verify the live health endpoint after each deployment.
+# Review changes to deployment permissions before merging.
+name: Deploy backend to Azure
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+jobs:
+  deploy:
+    if: ${{ vars.ENABLE_AZURE_DEPLOY == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push image
+        env:
+          REPOSITORY: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          image="ghcr.io/${REPOSITORY,,}/notes-backend:$COMMIT"
+          docker build -t "$image" .
+          docker push "$image"
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Deploy image
+        env:
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          CONTAINER_APP: ${{ vars.AZURE_CONTAINER_APP }}
+        run: az containerapp update --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" --image "$IMAGE" --min-replicas 0 --max-replicas 1

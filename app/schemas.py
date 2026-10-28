@@ -29,7 +29,7 @@ Question answers reuse the Phase 2 answer function.
 Tests replace model loading and all external calls.
 Tests never need real credentials or a real dotenv file.
 
-No authentication, quota, cache, or frontend is added here.
+Ask responses include the Phase 5 remaining daily allowance.
 Run the API from the repository root.
 Use uv run pytest for the offline test suite.
 """
@@ -64,6 +64,28 @@ class DocumentOut(BaseModel):
     status: Literal["processing", "ready", "failed"]
     created_at: datetime
     error: str | None = None
+    file_type: Literal["pdf", "pptx"] = "pdf"
+    embedded_chunks: int | None = None
+    total_chunks: int | None = None
+
+
+class Source(BaseModel):
+    source_type: Literal["official", "personal"] = "official"
+    figure_id: UUID | None = None
+    document_id: UUID | None = None
+    n: int
+    document: str
+    module: int | None
+    page: int
+    score: float
+    page_label: str | None = None
+
+
+
+class ChatTurn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)]
+    sources: list[Source] = Field(default_factory=list, max_length=5)
 
 
 class AskRequest(BaseModel):
@@ -71,14 +93,10 @@ class AskRequest(BaseModel):
     subject_id: int = Field(gt=0)
     module_id: int | None = Field(default=None, gt=0)
     document_id: UUID | None = None
+    mode: Literal["normal", "strict"] = "normal"
+    history: list[ChatTurn] = Field(default_factory=list, max_length=6)
 
 
-class Source(BaseModel):
-    n: int
-    document: str
-    module: int | None
-    page: int
-    score: float
 
 
 class Usage(BaseModel):
@@ -90,4 +108,5 @@ class AskResponse(BaseModel):
     answer: str
     sources: list[Source]
     usage: Usage
+    remaining: int
 
