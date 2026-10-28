@@ -419,3 +419,19 @@ def test_browser_cookie_session_rotation_and_logout(auth_backend):
     assert client.post("/auth/refresh").status_code == 403
     assert client.post("/auth/logout", headers=headers).status_code == 200
     assert client.post("/auth/refresh", headers=headers).status_code == 401
+
+
+def test_proxy_cookie_path_and_logout(auth_backend, monkeypatch):
+    client, provider = auth_backend
+    monkeypatch.setenv("AUTH_COOKIE_PATH", "/api/auth")
+    headers = {"X-Browser-Session": "1"}
+    verified = client.post("/auth/verify", headers=headers, json={"email": "student@dxb.manipal.edu", "code": "123456"})
+    cookie = verified.headers["set-cookie"]
+    assert "Path=/api/auth" in cookie
+    assert "HttpOnly" in cookie and "Secure" in cookie and "SameSite=lax" in cookie
+    assert "Domain=" not in cookie
+    refreshed = client.post("/auth/refresh", headers={**headers, "Cookie": "notes_refresh=fake-refresh"})
+    assert refreshed.status_code == 200
+    assert "Path=/api/auth" in refreshed.headers["set-cookie"]
+    logout = client.post("/auth/logout", headers=headers)
+    assert "Path=/api/auth" in logout.headers["set-cookie"]

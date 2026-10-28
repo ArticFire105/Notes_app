@@ -742,6 +742,29 @@ def test_powerpoint_preview_returns_converted_pdf(client, monkeypatch):
     convert.assert_called_once_with(b"original-pptx")
 
 
+def test_authenticated_document_file_returns_private_bytes(client, monkeypatch):
+    monkeypatch.setattr(documents, "get_document", lambda document_id: {"storage_path": "official/test.pdf"})
+    monkeypatch.setattr(documents, "download_document", lambda path: b"%PDF-example")
+    response = client.get(f"/documents/{DOCUMENT_ID}/file")
+    assert response.status_code == 200
+    assert response.content == b"%PDF-example"
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_personal_note_file_checks_owner_before_download(client, monkeypatch):
+    from app.routers import notes
+    context = MagicMock()
+    cursor = context.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = None
+    bucket = MagicMock()
+    monkeypatch.setattr(notes, "get_conn", context)
+    monkeypatch.setattr(notes, "personal_bucket", lambda: bucket)
+    response = client.get(f"/notes/{DOCUMENT_ID}/file")
+    assert response.status_code == 404
+    bucket.download.assert_not_called()
+    assert "user_id = %s" in cursor.execute.call_args.args[0]
+
+
 def test_powerpoint_converter_requires_libreoffice(monkeypatch):
     monkeypatch.setattr(documents.shutil, "which", lambda name: None)
     monkeypatch.setattr(documents.Path, "is_file", lambda self: False)

@@ -44,6 +44,37 @@ const session = { access_token: "fake-access", refresh_token: "fake-refresh", ex
 
 afterEach(() => { clearSession(); globalThis.fetch = originalFetch; });
 
+test("production calls the same-origin API path", async () => {
+  const previous = process.env.NODE_ENV;
+  process.env.NODE_ENV = "production";
+  try {
+    const production = await import("../lib/api.ts?production");
+    globalThis.fetch = async (url, init) => {
+      assert.equal(url, "/api/auth/send-code");
+      assert.equal(init.credentials, "include");
+      return Response.json({ message: "ok" });
+    };
+    await production.api.sendCode("student@dxb.manipal.edu");
+  } finally {
+    if (previous === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previous;
+  }
+});
+
+test("rewrite forwards the API path to the configured backend without edge caching", async () => {
+  const previous = process.env.BACKEND_ORIGIN;
+  process.env.BACKEND_ORIGIN = "https://backend.example.invalid";
+  try {
+    const { default: config } = await import("../next.config.mjs?test");
+    assert.deepEqual(await config.rewrites(), [{ source: "/api/:path*", destination: "https://backend.example.invalid/:path*" }]);
+    const headers = await config.headers();
+    assert.equal(headers[0].headers[0].value, "0");
+  } finally {
+    if (previous === undefined) delete process.env.BACKEND_ORIGIN;
+    else process.env.BACKEND_ORIGIN = previous;
+  }
+});
+
 test("scope IDs and BYOK travel only to the backend with the correct headers", async () => {
   const calls = [];
   globalThis.fetch = async (url, init) => {

@@ -85,7 +85,10 @@ async function cached<T>(key: string, load: () => Promise<T>): Promise<T> {
 
 let refreshPromise: Promise<void> | null = null;
 
-const baseUrl = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000").replace(/\/$/, "");
+// Production uses the same origin so the refresh cookie reaches the browser.
+const baseUrl = process.env.NODE_ENV === "production"
+  ? "/api"
+  : (process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000").replace(/\/$/, "");
 
 export class ApiError extends Error {
   status: number;
@@ -214,7 +217,7 @@ export const api = {
   noteJob: (id: string, signal?: AbortSignal) => request<NoteJob>(`/notes/jobs/${id}`, { signal }),
   uploadNote: (data: FormData) => request<PersonalNote>("/notes", { method: "POST", body: data }, true, true).then(value => { invalidateData("documents"); return value; }),
   deleteNote: (subjectId: number) => request(`/notes/${subjectId}`, { method: "DELETE" }).then(value => { invalidateData("documents"); return value; }),
-  noteFile: (id: string) => request<{ url: string }>(`/notes/${id}/file-url`),
+  noteFile: (id: string) => request<Blob>(`/notes/${id}/file`, {}, true, false, true),
   deleteSubject: (id: number) => request(`/subjects/${id}`, { method: "DELETE" }).then(value => { invalidateData(); return value; }),
   createModule: (subjectId: number, number: number, title: string) => request<Module>(`/subjects/${subjectId}/modules`, { method: "POST", body: JSON.stringify({ number, title }) }).then(value => { invalidateData(); return value; }),
   renameModule: (id: number, title: string) => request<Module>(`/modules/${id}`, { method: "PUT", body: JSON.stringify({ title }) }).then(value => { invalidateData(); return value; }),
@@ -228,7 +231,7 @@ export const api = {
   figure: (id: string) => request<Blob>(`/figures/${id}`, {}, true, false, true),
   preview: (id: string) => request<Blob>(`/documents/${id}/preview`, {}, true, false, true),
   slide: (id: string, number: number) => request<Slide>(`/documents/${id}/slides/${number}`),
-  fileUrl: (id: string) => request<{ url: string }>(`/documents/${id}/file-url`),
+  file: (id: string) => request<Blob>(`/documents/${id}/file`, {}, true, false, true),
   testKey: () => request<{ ok: boolean }>("/me/test-key", { method: "POST" }, true, true),
   ask: (question: string, subjectId: number, moduleId: number | null, documentId: string | null, mode: "normal" | "strict" = "normal", history: Message[] = []) =>
     request<Answer>("/ask", { method: "POST", body: JSON.stringify({
