@@ -40,7 +40,8 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { ArrowLeft, ArrowUpRight, BookOpen, FileText, Send, Sparkles, Layers, ChevronDown } from "lucide-react";
-import { api, errorMessage, processNote, type PersonalNote, type Subject, type Module, type Document, type Usage, type Source } from "@/lib/api";
+import { api, errorMessage, processNote, type PersonalNote, type Subject, type Module, type Document, type Usage, type Source, type DesignKind, type DesignAnswer } from "@/lib/api";
+import { DesignDiagramView } from "@/components/design-diagram";
 import { useSession } from "@/components/session-provider";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -75,6 +76,9 @@ export default function SubjectPage() {
   const [moduleId, setModuleId] = useState<number | null>(null);
   const [documentId, setDocumentId] = useState("");
   const [mode, setMode] = useState<"normal" | "strict">("normal");
+  const [designMode, setDesignMode] = useState(false);
+  const [designKind, setDesignKind] = useState<DesignKind>("usecase");
+  const [designResult, setDesignResult] = useState<DesignAnswer | null>(null);
   const [scope, setScope] = useState<Scope>("module");
   const [worksheetId, setWorksheetId] = useState("");
   const [answerMethod, setAnswerMethod] = useState("one");
@@ -191,6 +195,12 @@ export default function SubjectPage() {
     if (!text || busy || (scope !== "subject" && !moduleId) || (scope === "document" && !selectedDocumentId)) return;
     setBusy(true); setError("");
     try {
+      if (designMode) {
+        const answer = await api.design(text, subjectId, scope === "subject" ? null : moduleId, scope === "document" ? selectedDocumentId : null, mode, designKind);
+        setDesignResult(answer); setQuestion("");
+        setUsage(previous => previous ? { ...previous, used: Math.max(0, previous.limit - answer.remaining) } : previous);
+        return;
+      }
       const answer = await api.ask(text, subjectId, scope === "subject" ? null : moduleId, scope === "document" ? selectedDocumentId : null, mode, messages);
       appendChat(subjectId, [
         { role: "user", content: text },
@@ -242,11 +252,13 @@ export default function SubjectPage() {
       <Card className="overflow-hidden">
         <div className="flex items-center justify-between gap-3 border-b border-border px-5 py-5 sm:px-6"><div className="flex items-center gap-3"><span className="grid size-9 place-items-center rounded-xl bg-background"><Sparkles size={18} className="text-gold" /></span><div><h2 className="font-heading text-xl font-semibold">Ask your notes</h2></div></div><Button variant="ghost" size="sm" disabled={busy || !messages.length} onClick={() => clearChat(subjectId)}>New chat</Button><span className="rounded-full bg-background px-3 py-1.5 text-xs text-primary">{remaining ?? "—"}/{usage?.limit ?? "—"} left today</span></div>
         <div className="space-y-4 border-b border-border bg-[#fcfbf8] p-5 sm:px-6">
+          {scope !== "worksheet" && <div className="flex flex-wrap items-center gap-3"><Button type="button" variant={designMode ? "default" : "outline"} size="sm" disabled={busy} onClick={() => setDesignMode(!designMode)}>{designMode ? "Design mode on" : "Design mode"}</Button>{designMode && <label className="text-sm">Diagram type <select value={designKind} onChange={event => setDesignKind(event.target.value as DesignKind)}><option value="usecase">Use case</option><option value="class">Class</option><option value="wbs">WBS</option><option value="schedule">Project schedule</option></select></label>}</div>}
           <fieldset disabled={busy}><legend className="mb-2 text-xs font-medium text-muted-foreground">Answer mode</legend><div className="flex gap-1 rounded-lg bg-muted p-1">{(["normal", "strict"] as const).map(value => <label key={value} className={cn("flex-1 cursor-pointer rounded-md px-3 py-2 text-center text-xs capitalize", mode === value ? "bg-white text-primary shadow-sm" : "text-muted-foreground")}><input type="radio" name="mode" value={value} checked={mode === value} onChange={() => { setMode(value); if (scope === "worksheet" && worksheetId) void api.worksheetMode(worksheetId, value).catch(e => setError(errorMessage(e))); }} className="sr-only" />{value}</label>)}</div></fieldset>
           <fieldset disabled={busy}><legend className="mb-2 text-xs font-medium text-muted-foreground">Question scope</legend><div className="grid grid-cols-2 sm:grid-cols-4 gap-1 rounded-lg bg-muted p-1">{([["module", "This module"], ["document", "This document"], ["subject", "Whole subject"], ["worksheet", "Worksheet"]] as const).map(([value, label]) => <label key={value} className={cn("cursor-pointer rounded-md px-1 py-2 text-center text-xs transition-colors sm:px-3", scope === value ? "bg-white text-primary shadow-sm" : "text-muted-foreground")}><input type="radio" name="scope" value={value} checked={scope === value} onChange={() => setScope(value)} className="sr-only" />{label}</label>)}</div></fieldset>
           {scope !== "subject" && scope !== "worksheet" && <div className="grid gap-3 sm:grid-cols-2"><div><label htmlFor="module" className="sr-only">Selected module</label><select id="module" value={moduleId ?? ""} disabled={busy} onChange={event => { setModuleId(Number(event.target.value)); setDocumentId(""); }}><option value="" disabled>Select module</option>{modules.map(module => <option key={module.id} value={module.id}>Module {module.number} · {module.title}</option>)}</select></div>{scope === "document" && <div><label htmlFor="pdf" className="sr-only">Selected document</label><select id="pdf" value={selectedDocumentId} disabled={busy || !ready.length} onChange={event => setDocumentId(event.target.value)}>{!ready.length && <option value="">No ready documents</option>}{ready.map(document => <option key={document.id} value={document.id}>{document.title}</option>)}</select></div>}</div>}
         </div>
         {scope === "worksheet" ? <WorksheetChat selected={worksheetId} answerMethod={answerMethod} setAnswerMethod={setAnswerMethod} openSource={openSource} Figure={Figure} /> : <CardContent className="p-0">
+          {designMode && designResult && <div className="border-b p-5"><p className="whitespace-pre-wrap text-sm">{designResult.answer}</p>{designResult.diagram && <DesignDiagramView key={JSON.stringify(designResult.diagram)} initial={designResult.diagram} />}{designResult.sources.map(source => <button type="button" key={source.n} className="mt-2 block text-left text-xs underline" onClick={() => openSource(source)}>[{source.n}] {source.document} · {source.page_label || `p.${source.page}`}</button>)}</div>}
           <div className="max-h-[560px] min-h-80 space-y-6 overflow-y-auto p-5 sm:p-6" aria-live="polite" aria-busy={busy}>
             {!messages.length && !busy && <div className="flex min-h-64 flex-col items-center justify-center text-center"><span className="mb-5 grid size-14 place-items-center rounded-2xl border border-border bg-background"><BookOpen size={26} strokeWidth={1.3} className="text-primary" /></span><h3 className="font-heading text-xl">Start with a question.</h3><p className="mt-2 max-w-xs text-sm leading-6 text-muted-foreground">Ask about a concept, request an explanation, or connect ideas from your course notes.</p></div>}
             {messages.map((message, index) => <div key={index} className={cn("flex", message.role === "user" ? "justify-end" : "justify-start")}><div className={cn("max-w-[95%] rounded-2xl px-4 py-3 text-sm leading-7 sm:max-w-[90%]", message.role === "user" ? "rounded-br-sm bg-primary text-white" : "w-full rounded-bl-sm border border-border bg-[#fcfbf8]")}><p className="mb-1 text-[10px] font-semibold uppercase tracking-wider opacity-60">{message.role === "user" ? "You" : "Lecture Notes"}</p><p className="whitespace-pre-wrap break-words">{message.content}</p>{message.role === "assistant" && !!message.sources?.length && <details className="mt-4 border-t border-border pt-3"><summary className="text-xs font-medium text-primary">Sources ({message.sources?.length || 0})</summary><div className="mt-3 space-y-2">{message.sources?.map(source => <button type="button" key={source.n} onClick={() => openSource(source)} className="block w-full rounded-lg bg-white p-3 text-left text-xs leading-5 text-primary underline">[{source.n}] {subject.code} · {source.module !== null ? `Module ${source.module}` : "Whole subject"} · {source.document} · {source.page_label || `p.${source.page}`} </button>)}{message.sources?.filter(source => source.figure_id).map(source => <Figure key={source.n} id={source.figure_id!} />)}{!message.sources?.length && <p className="text-xs text-muted-foreground">No supporting notes found in this scope.</p>}</div></details>}</div></div>)}
