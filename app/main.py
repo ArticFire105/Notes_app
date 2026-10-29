@@ -132,6 +132,7 @@ def create_app():
         max_age=86400,
         allow_methods=["GET", "POST", "PUT", "DELETE"],
         allow_headers=["Authorization", "Content-Type", "X-User-Api-Key", "X-Browser-Session"],
+        expose_headers=["Retry-After"],
     )
     application.get("/health")(health)
     application.include_router(login.router)

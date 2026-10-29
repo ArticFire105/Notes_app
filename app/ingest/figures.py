@@ -37,6 +37,7 @@ Run backend tests with uv run pytest.
 """
 
 import base64
+import logging
 from io import BytesIO
 from pathlib import Path
 
@@ -45,7 +46,7 @@ from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pypdf import PdfReader
 
-from app.llm import get_chat_model, provider_errors
+from app.llm import get_chat_model, quiet_chat_output
 
 
 def prepare_image(data):
@@ -89,11 +90,26 @@ def extract_figures(source, file_type):
 
 def describe_figure(data):
     encoded = base64.b64encode(data).decode("ascii")
-    with provider_errors():
-        response = get_chat_model().invoke([("human", [
+    try:
+        with quiet_chat_output():
+            response = get_chat_model().invoke([("human", [
             {"type": "text", "text": "Describe this lecture figure for a student. Explain the visible labels, relationships and flow. Do not invent missing details."},
             {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + encoded}},
-        ])])
+            ])])
+    except Exception as error:
+        # Provider messages can contain document content or credentials; log only a numeric status.
+        status = "unknown"
+        current = error
+        seen = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            candidate = getattr(current, "status_code", None) or getattr(current, "code", None)
+            if type(candidate) is int and 100 <= candidate <= 599:
+                status = candidate
+                break
+            current = current.__cause__ or current.__context__
+        logging.getLogger("uvicorn.error").warning("Figure description failed: provider_status=%s", status)
+        raise ValueError("Figure description service failed.") from None
     content = response.content
     if isinstance(content, list):
         content = "".join(block.get("text", "") for block in content if isinstance(block, dict))

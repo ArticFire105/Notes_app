@@ -248,7 +248,7 @@ def test_cli_document_without_storage_has_no_url(client, backend, record):
 def test_upload_returns_processing_and_schedules_ingest(client, backend, record, pdf, monkeypatch):
     enqueue = MagicMock()
     monkeypatch.setattr(documents, "enqueue_document", enqueue)
-    backend.cursor.fetchone.side_effect = [{"code": "OS"}, {"number": 2}, record]
+    backend.cursor.fetchone.side_effect = [{"code": "OS"}, {"number": 2}, None, record]
     response = post_pdf(client, pdf)
     assert response.status_code == 202
     assert response.json()["id"] == str(DOCUMENT_ID)
@@ -264,7 +264,7 @@ def test_upload_returns_processing_and_schedules_ingest(client, backend, record,
 
 
 def test_ingest_is_queued_not_run_by_upload_handler(backend, record, pdf, monkeypatch):
-    backend.cursor.fetchone.side_effect = [{"code": "OS"}, {"number": 2}, record]
+    backend.cursor.fetchone.side_effect = [{"code": "OS"}, {"number": 2}, None, record]
     tasks = BackgroundTasks()
     enqueue = MagicMock()
     monkeypatch.setattr(documents, "enqueue_document", enqueue)
@@ -312,13 +312,19 @@ def test_upload_requires_subject_module_relationship(client, backend, pdf, rows)
 
 def test_failed_sql_insert_cleans_storage(client, backend, pdf):
     backend.cursor.fetchone.side_effect = [
-        {"code": "OS"}, {"number": 2}, RuntimeError("dummy-secret"),
+        {"code": "OS"}, {"number": 2}, None, RuntimeError("dummy-secret"),
     ]
     response = post_pdf(client, pdf)
     assert response.status_code == 500
     assert "dummy-secret" not in response.text
     backend.remove.assert_called_once_with(f"official/OS/module-2/{DOCUMENT_ID}.pdf")
     backend.ingest.assert_not_called()
+
+
+def test_duplicate_upload_is_rejected_before_storage(client, backend, pdf):
+    backend.cursor.fetchone.side_effect = [{"code": "OS"}, {"number": 2}, {"id": DOCUMENT_ID}]
+    assert post_pdf(client, pdf).status_code == 409
+    backend.upload.assert_not_called()
 
 
 def test_background_failure_is_recorded_safely(backend):
@@ -399,7 +405,7 @@ def test_pptx_upload_stores_original_format_and_uses_shared_ingest(client, backe
     enqueue = MagicMock()
     monkeypatch.setattr(documents, "enqueue_document", enqueue)
     content = make_pptx_bytes()
-    backend.cursor.fetchone.side_effect = [{"code": "OS"}, {"number": 2}, record]
+    backend.cursor.fetchone.side_effect = [{"code": "OS"}, {"number": 2}, None, record]
     response = client.post(
         "/documents", files={"file": ("lecture.PPTX", content, documents.PPTX_CONTENT_TYPE)},
         data={"subject_id": 1, "module_id": 12, "title": "Lecture"},

@@ -66,17 +66,35 @@ def ingest_document(
             if text:
                 chunks.append({**chunk, "content": text})
         reason = "Could not extract or describe document figures."
-        figures = extract_figures(path, file_type) if source_type == "official" else []
+        figure_warning = None
+        try:
+            figures = extract_figures(path, file_type) if source_type == "official" else []
+        except Exception as error:
+            log_safe_exception(error, "Figure extraction failed; text will still be indexed if available.")
+            figures = []
+            figure_warning = "Some figures could not be processed; text was indexed."
         descriptions = {}
+        described_figures = []
         for figure in figures:
             label = "Slide" if file_type == "pptx" else "page"
             # Repeated diagrams need separate page citations, but one description.
             if figure["data"] not in descriptions:
-                descriptions[figure["data"]] = describe_figure(figure["data"])
+                try:
+                    descriptions[figure["data"]] = describe_figure(figure["data"])
+                except Exception as error:
+                    log_safe_exception(error, "Figure description failed; skipping this figure.")
+                    descriptions[figure["data"]] = None
+                    figure_warning = "Some figures could not be processed; text was indexed."
             caption = descriptions[figure["data"]]
+            if caption is None:
+                continue
             figure["content"] = prepare_embedding_text(f"[Figure on {label} {figure['page']}]: {caption}")
             figure["id"] = uuid4()
+            described_figures.append(figure)
+        figures = described_figures
         if not chunks and not figures:
+            if figure_warning:
+                raise IngestError("Could not process figures and no readable text was available.", safe_reason="Could not process figures and no readable text was available.")
             hint = "PPTX needs readable slide text or speaker notes." if file_type == "pptx" else "Scanned PDFs need Phase 7 OCR."
             raise IngestError(
                 f"No usable text: pages read={page_count}, pages skipped={skipped}, "
@@ -177,8 +195,8 @@ def ingest_document(
 
                 # Publish readiness in the same transaction as the chunks.
                 cursor.execute(
-                    "update documents set status = 'ready', error = null, page_count = %s where id = %s",
-                    (page_count, document_id),
+                    "update documents set status = 'ready', error = %s, page_count = %s where id = %s",
+                    (figure_warning, page_count, document_id),
                 )
                 invalidate_scope(subject_id, cursor)
 

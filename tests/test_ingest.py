@@ -183,7 +183,7 @@ def test_existing_document_ingestion_reuses_row_and_marks_ready(ingestion):
     assert "status = 'processing'" in calls[1].args[0]
     assert "status = 'ready'" in calls[-2].args[0]
     assert calls[-1].args == ("delete from answer_cache where subject_id = %s", (1,))
-    assert calls[-2].args[1] == (2, result)
+    assert calls[-2].args[1] == (None, 2, result)
     assert ingestion.cursor.executemany.call_args.args[1][0][0] == result
     ingestion.context.return_value.__exit__.assert_called_once_with(None, None, None)
 
@@ -307,7 +307,7 @@ def test_pptx_uses_shared_chunk_embedding_and_storage_pipeline(ingestion, monkey
     assert "only text on slide three" in rows[1][6]
     assert all(row[7].dimensions() == 768 for row in rows)
     assert ingestion.embed.call_count == 1
-    assert any(call.args[1] == (3, result) for call in ingestion.cursor.execute.call_args_list
+    assert any(call.args[1] == (None, 3, result) for call in ingestion.cursor.execute.call_args_list
                if "status = 'ready'" in call.args[0])
 
 
@@ -442,6 +442,28 @@ def test_figure_captions_are_embedded_as_text_and_saved_with_image(ingestion, mo
     figure_insert = next(call for call in ingestion.cursor.execute.call_args_list if "insert into course_figures" in call.args[0])
     assert figure_insert.args[1][-1] == b"fake-image-bytes"
     assert any("figure_id" in call.args[0] for call in ingestion.cursor.execute.call_args_list)
+
+
+def test_failed_figure_still_indexes_text_with_warning(ingestion, monkeypatch):
+    monkeypatch.setattr(pipeline, "extract_figures", lambda *args: [{"page": 2, "data": b"image"}])
+    monkeypatch.setattr(pipeline, "describe_figure", MagicMock(side_effect=ValueError("private text")))
+    pipeline.ingest_pdf("dummy.pdf", "OS", 2, "Memory")
+    update = next(call for call in ingestion.cursor.execute.call_args_list if "update documents set status = 'ready'" in call.args[0])
+    assert "figures could not be processed" in update.args[1][0]
+    assert ingestion.cursor.executemany.called
+    assert not any("insert into course_figures" in call.args[0] for call in ingestion.cursor.execute.call_args_list)
+
+
+def test_figure_provider_log_excludes_private_error_text(monkeypatch, caplog):
+    from app.ingest import figures
+    error = RuntimeError("private document and fake-key")
+    error.code = 429
+    monkeypatch.setattr(figures, "get_chat_model", MagicMock(side_effect=error))
+    with pytest.raises(ValueError):
+        figures.describe_figure(b"fake-image")
+    assert "provider_status=429" in caplog.text
+    assert "private document" not in caplog.text
+    assert "fake-key" not in caplog.text
 
 
 def test_extract_pptx_picture_and_skip_small_icon():

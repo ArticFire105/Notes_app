@@ -143,7 +143,8 @@ def _process_queue():
             document = get_document(document_id)
             with _queue_lock:
                 _queue_items[document_id].update(status=document["status"], error=document.get("error"), queue_status=document["status"])
-        except Exception:
+        except Exception as error:
+            log_safe_exception(error, "Upload queue worker failed.")
             with _queue_lock:
                 _queue_items[document_id].update(status="failed", queue_status="failed", error="Could not process this file. Please retry.")
         finally:
@@ -194,7 +195,11 @@ def retry_upload(document_id: UUID, user=Depends(require_role("admin"))):
             row = cursor.fetchone()
             if not row or not row["storage_path"]:
                 raise HTTPException(404, "The uploaded file is no longer available.")
-            data = download_document(row["storage_path"])
+            try:
+                data = download_document(row["storage_path"])
+            except Exception as error:
+                log_safe_exception(error, "Could not retrieve stored file for upload retry.")
+                raise HTTPException(503, "Could not retrieve the stored file for retry.") from None
             cursor.execute("update documents set status = 'processing', error = null, job_heartbeat_at = now() where id = %s and status = 'failed'", (document_id,))
             if cursor.rowcount != 1:
                 raise HTTPException(409, "This upload is no longer failed.")
@@ -295,10 +300,17 @@ def queue_document(background_tasks, file_bytes, subject_id, module_id, title, u
                 raise HTTPException(404, "Module not found in this subject.")
     document_id = uuid4()
     path = f"official/{subject['code']}/module-{module['number']}/{document_id}.{file_type}"
-    upload_document(file_bytes, path)
+    uploaded = False
     try:
         with get_conn() as connection:
             with connection.cursor(row_factory=dict_row) as cursor:
+                # The module lock makes the duplicate check safe across concurrent requests.
+                cursor.execute("select id from modules where id = %s for update", (module_id,))
+                cursor.execute("select id from documents where module_id = %s and source_type = 'official' and lower(title) = lower(%s)", (module_id, title))
+                if cursor.fetchone() is not None:
+                    raise HTTPException(409, "This document already exists in this module. Retry the existing upload instead.")
+                upload_document(file_bytes, path)
+                uploaded = True
                 cursor.execute(
                     """
                     insert into documents
@@ -309,11 +321,15 @@ def queue_document(background_tasks, file_bytes, subject_id, module_id, title, u
                     (document_id, subject_id, module_id, title, path, uploaded_by),
                 )
                 document = cursor.fetchone()
-    except Exception:
-        try:
-            delete_document(path)
-        except Exception:
-            pass
+    except HTTPException:
+        raise
+    except Exception as error:
+        log_safe_exception(error, "Could not store or record uploaded document.")
+        if uploaded:
+            try:
+                delete_document(path)
+            except Exception as cleanup_error:
+                log_safe_exception(cleanup_error, "Could not remove upload after database failure.")
         raise HTTPException(500, "Could not record the uploaded document.") from None
     document["module"] = module["number"]
     document["file_type"] = file_type
