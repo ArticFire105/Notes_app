@@ -34,17 +34,24 @@ Run uv run pytest from the repository root.
 Start FastAPI before starting Streamlit.
 """
 
+import logging
 import os
+from typing import get_args
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, SecretStr
 from supabase import ClientOptions, create_client
+from supabase_auth.errors import AuthApiError, ErrorCode
 
 from app.auth import is_allowed_email
 from app.config import Settings
 
 router = APIRouter(prefix="/auth", tags=["login"])
+logger = logging.getLogger("uvicorn.error")
+
+# Only exact, known provider messages can be logged without risking personal data.
+SAFE_OTP_MESSAGES = {"Token has expired or is invalid", "Email link is invalid or has expired"}
 
 
 def cookie_path():
@@ -112,15 +119,24 @@ def send_code(request: EmailRequest):
 def verify_code(request: VerifyRequest, http_request: Request):
     settings, client = login_client()
     email = college_email(request.email, settings)
-    code = request.code.get_secret_value()
+    code = request.code.get_secret_value().strip()
     if not 6 <= len(code) <= 8 or not code.isascii() or not code.isdigit():
         raise HTTPException(400, "Enter the 6–8 digit email code.")
     try:
         session = client.auth.verify_otp(
             {"email": email, "token": code, "type": "email"}
         ).session
-    except Exception:
+    except AuthApiError as error:
+        code_name = error.code if error.code in get_args(ErrorCode) else "unknown"
+        message = error.message if error.message in SAFE_OTP_MESSAGES else "[provider message omitted]"
+        status = error.status if isinstance(error.status, int) and 100 <= error.status <= 599 else 0
+        logger.warning("OTP verify failed: provider_status=%s provider_code=%s provider_message=%s", status, code_name, message)
+        if status == 429 or status >= 500 or status == 0:
+            raise HTTPException(503, "Login service unavailable. Please try again later.") from None
         raise HTTPException(401, "Code invalid or expired. Request a new code.") from None
+    except Exception:
+        logger.warning("OTP verify failed: unexpected provider or connection error")
+        raise HTTPException(503, "Login service unavailable. Please try again later.") from None
     return session_response(session, http_request)
 
 

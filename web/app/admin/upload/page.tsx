@@ -38,7 +38,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { CheckCircle2, FileText, Upload, LoaderCircle, AlertCircle } from "lucide-react";
-import { api, errorMessage, invalidateData, type Document, type QueueDocument, type Module, type Subject } from "@/lib/api";
+import { api, ApiError, errorMessage, invalidateData, type Document, type QueueDocument, type Module, type Subject } from "@/lib/api";
 import { useSession } from "@/components/session-provider";
 import { DocumentManager } from "@/components/document-manager";
 import { Button } from "@/components/ui/button";
@@ -61,6 +61,9 @@ export default function UploadPage() {
   const [files, setFiles] = useState<File[]>([]);
   const [queue, setQueue] = useState<QueueDocument[]>([]);
   const [uploadErrors, setUploadErrors] = useState<string[]>([]);
+  const [uploadStatus, setUploadStatus] = useState("");
+  const [retrying, setRetrying] = useState<string | null>(null);
+  const [retryError, setRetryError] = useState("");
   const [upload, setUpload] = useState<Document | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadingModules, setLoadingModules] = useState(false);
@@ -173,8 +176,17 @@ export default function UploadPage() {
       data.set("subject_id", subjectId); data.set("module_id", moduleId);
       data.set("title", files.length === 1 && title.trim() ? title.trim() : file.name.replace(/\.(pdf|pptx)$/i, ""));
       data.set("file", file);
-      try { await api.upload(data); }
-      catch (error) { errors.push(`${file.name}: ${errorMessage(error)}`); }
+      while (true) {
+        try { await api.upload(data); setUploadStatus(""); break; }
+        catch (error) {
+          if (error instanceof ApiError && error.status === 429 && error.retryAfter) {
+            setUploadStatus(`Upload limit reached. Waiting ${error.retryAfter} seconds before continuing with ${file.name}. Keep this page open.`);
+            await new Promise(resolve => setTimeout(resolve, error.retryAfter! * 1000));
+            continue;
+          }
+          errors.push(`${file.name}: ${errorMessage(error)}`); break;
+        }
+      }
     }
     setUploadErrors(errors);
     try { setQueue(await api.uploadQueue()); } catch { setError("Could not load upload status."); }
@@ -185,8 +197,10 @@ export default function UploadPage() {
   }
 
   async function retry(id: string) {
+    setRetrying(id); setRetryError("");
     try { await api.retryUpload(id); setQueue(await api.uploadQueue()); }
-    catch (error) { setError(errorMessage(error)); }
+    catch (error) { setRetryError(`Could not start retry: ${errorMessage(error)}`); }
+    finally { setRetrying(null); }
   }
 
   if (!isAdmin) return <p role="alert" className="p-6 text-sm">Administrator access required.</p>;
@@ -200,12 +214,14 @@ export default function UploadPage() {
       {loading ? <p role="status" className="text-sm text-muted-foreground">Loading subjects…</p> : <form onSubmit={submit}><fieldset disabled={busy} className="space-y-5">
         <div className="grid gap-4 sm:grid-cols-2"><div className="space-y-2"><label htmlFor="upload-subject">Subject</label><select id="upload-subject" value={subjectId} required onChange={event => { setSubjectId(event.target.value); setModuleId(""); setModules([]); }}><option value="" disabled>Select a subject</option>{subjects.map(subject => <option key={subject.id} value={subject.id}>{subject.code} · {subject.name}</option>)}</select></div><div className="space-y-2"><label htmlFor="upload-module">Module</label><select id="upload-module" value={moduleId} required disabled={loadingModules} onChange={event => setModuleId(event.target.value)}><option value="" disabled>{loadingModules ? "Loading modules…" : "Select a module"}</option>{modules.map(module => <option key={module.id} value={module.id}>Module {module.number} · {module.title}</option>)}</select></div></div>
         <div className="space-y-2"><label htmlFor="title">Document title</label><Input id="title" maxLength={500} placeholder="e.g. Memory Management" value={title} onChange={event => setTitle(event.target.value)} /></div>
-        <div onDragOver={event => event.preventDefault()} onDrop={event => { event.preventDefault(); setFiles(Array.from(event.dataTransfer.files)); }} className="rounded-xl border border-dashed border-primary/30 bg-background/40 p-6 text-center"><Upload size={28} strokeWidth={1.3} className="mx-auto mb-3 text-primary" /><label htmlFor="file" className="mb-2 block">Choose files or drop them here</label><Input ref={fileInput} id="file" type="file" multiple accept=".pdf,.pptx,.ppt,application/pdf,application/vnd.openxmlformats-officedocument.presentationml.presentation" className="mx-auto max-w-sm cursor-pointer bg-white text-xs" onChange={event => setFiles(Array.from(event.target.files || []))} /><p className="mt-3 text-xs text-muted-foreground">PDF or PPTX · max 40 MB · save old .ppt as .pptx</p></div>
+        <div onDragOver={event => event.preventDefault()} onDrop={event => { event.preventDefault(); setFiles(Array.from(event.dataTransfer.files)); }} className="rounded-xl border border-dashed border-primary/30 bg-background/40 p-6 text-center"><Upload size={28} strokeWidth={1.3} className="mx-auto mb-3 text-primary" /><p className="mb-3">Choose files or drop them here</p><input ref={fileInput} id="file" type="file" multiple accept=".pdf,.pptx,.ppt,application/pdf,application/vnd.openxmlformats-officedocument.presentationml.presentation" className="sr-only" tabIndex={-1} onChange={event => setFiles(Array.from(event.target.files || []))} /><Button type="button" variant="outline" onClick={() => fileInput.current?.click()}>Choose files</Button><p className="mt-3 text-sm" aria-live="polite">{files.length ? files.map(file => file.name).join(", ") : "No files selected"}</p><p className="mt-3 text-xs text-muted-foreground">PDF or PPTX · max 40 MB · save old .ppt as .pptx</p></div>
         <Button type="submit" disabled={loadingModules || !moduleId}><Upload size={16} />{busy ? "Uploading…" : "Upload notes"}</Button>
       </fieldset></form>}
     </CardContent></Card>
     {uploadErrors.map(message => <p key={message} role="alert" className="text-sm text-red-700">{message}</p>)}
-    {queue.length > 0 && <Card aria-live="polite"><CardHeader><CardTitle>Upload queue</CardTitle></CardHeader><CardContent className="space-y-3">{queue.map(item => <div key={item.id} className="rounded-lg border p-3"><p className="font-medium">{item.title}</p><p className="text-sm">{item.queue_status === "queued" ? "Queued" : item.queue_status === "indexing" ? item.total_chunks != null ? `Indexing ${item.embedded_chunks ?? 0} of ${item.total_chunks} chunks` : "Indexing: preparing document" : item.queue_status === "ready" ? "Ready" : item.error || "Failed"}</p>{item.queue_status === "failed" && <Button type="button" size="sm" variant="outline" onClick={() => void retry(item.id)}>Retry</Button>}</div>)}</CardContent></Card>}
+    {uploadStatus && <p role="status" className="text-sm">{uploadStatus}</p>}
+    {retryError && <p role="alert" className="text-sm text-red-700">{retryError}</p>}
+    {queue.length > 0 && <Card aria-live="polite"><CardHeader><CardTitle>Upload queue</CardTitle></CardHeader><CardContent className="space-y-3">{queue.map(item => <div key={item.id} className="rounded-lg border p-3"><p className="font-medium">{item.title}</p><p className="text-sm">{item.queue_status === "queued" ? "Queued" : item.queue_status === "indexing" ? item.total_chunks != null ? `Indexing ${item.embedded_chunks ?? 0} of ${item.total_chunks} chunks` : "Indexing: preparing document" : item.queue_status === "ready" ? item.error ? `Ready. ${item.error}` : "Ready" : item.error || "Failed"}</p>{item.queue_status === "failed" && <Button type="button" size="sm" variant="outline" disabled={retrying !== null} onClick={() => void retry(item.id)}>{retrying === item.id ? "Starting…" : "Retry"}</Button>}</div>)}</CardContent></Card>}
     {subjectId && <Card><CardHeader><CardTitle>Manage subject and modules</CardTitle></CardHeader><CardContent className="space-y-4">
       <Button type="button" variant="outline" disabled={managing || busy} onClick={() => void deleteSubject()}>Delete this subject</Button>
       <form onSubmit={addModule} className="flex flex-wrap items-end gap-3"><div><label htmlFor="module-number" className="block text-sm">Number</label><Input id="module-number" type="number" min={1} max={999} required value={newModuleNumber} onChange={event => setNewModuleNumber(event.target.value)} /></div><div className="min-w-48 flex-1"><label htmlFor="module-title" className="block text-sm">Title</label><Input id="module-title" required maxLength={200} value={newModuleTitle} onChange={event => setNewModuleTitle(event.target.value)} /></div><Button type="submit" disabled={managing || !newModuleNumber || !newModuleTitle.trim()}>Add module</Button></form>

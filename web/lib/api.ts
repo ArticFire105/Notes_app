@@ -92,7 +92,8 @@ const baseUrl = process.env.NODE_ENV === "production"
 
 export class ApiError extends Error {
   status: number;
-  constructor(message: string, status = 0) { super(message); this.status = status; }
+  retryAfter: number | null;
+  constructor(message: string, status = 0, retryAfter: number | null = null) { super(message); this.status = status; this.retryAfter = retryAfter; }
 }
 
 export function saveSession(value: Session) {
@@ -151,14 +152,17 @@ async function request<T>(path: string, init: RequestInit = {}, authenticated = 
   if (authenticated && startedRevision !== revision) throw new ApiError("Your session changed. Please try again.");
   if (!response.ok) {
     if (response.status === 429 && response.headers.has("Retry-After")) {
-      throw new ApiError("Too many requests. Please wait and try again.", 429);
+      const seconds = Number(response.headers.get("Retry-After"));
+      if (Number.isInteger(seconds) && seconds > 0 && seconds <= 86400) {
+        throw new ApiError(`Too many requests. Try again in ${seconds} seconds.`, 429, seconds);
+      }
     }
     const messages: Record<number, string> = {
       400: "Check your input and try again. For email codes, you may need to wait before resending.",
       401: "Your session or email code has expired. Please sign in again.",
       403: "Use your college account. This action may require administrator access.",
       404: "This item is unavailable. Older documents may need to be uploaded again for PDF viewing.",
-      409: "This document already exists. Choose another title.",
+      409: "This document already exists in this module. Retry the existing upload or choose another title.",
       413: "Choose a PDF or PPTX file of 40 MB or smaller.",
       422: "Check the required fields and selected scope.",
       429: "Daily allowance or rate limit reached. Add your own key in Settings, or try later.",

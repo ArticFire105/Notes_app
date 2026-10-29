@@ -61,6 +61,12 @@ test("production calls the same-origin API path", async () => {
   }
 });
 
+test("rate limit reports the wait time", async () => {
+  saveSession(session);
+  globalThis.fetch = async () => new Response("", { status: 429, headers: { "Retry-After": "42" } });
+  await assert.rejects(api.upload(new FormData()), error => error.status === 429 && error.retryAfter === 42 && error.message.includes("42 seconds"));
+});
+
 test("rewrite forwards the API path to the configured backend without edge caching", async () => {
   const previous = process.env.BACKEND_ORIGIN;
   process.env.BACKEND_ORIGIN = "https://backend.example.invalid";

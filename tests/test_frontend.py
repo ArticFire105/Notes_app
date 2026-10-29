@@ -232,8 +232,33 @@ def test_otp_provider_errors_do_not_leak(auth_backend):
     client, provider = auth_backend
     provider.auth.verify_otp.side_effect = RuntimeError("fake-sensitive-auth-error")
     response = client.post("/auth/verify", json={"email": "student@dxb.manipal.edu", "code": "123456"})
-    assert response.status_code == 401
+    assert response.status_code == 503
     assert "fake-sensitive-auth-error" not in response.text
+
+
+def test_verify_normalizes_input_and_logs_safe_provider_error(auth_backend, caplog):
+    from supabase_auth.errors import AuthApiError
+
+    client, provider = auth_backend
+    provider.auth.verify_otp.side_effect = AuthApiError("Token has expired or is invalid", 403, "otp_expired")
+    response = client.post("/auth/verify", json={"email": " STUDENT@DXB.MANIPAL.EDU ", "code": " 123456 "})
+    assert response.status_code == 401
+    provider.auth.verify_otp.assert_called_once_with({"email": "student@dxb.manipal.edu", "token": "123456", "type": "email"})
+    assert "otp_expired" in caplog.text
+    assert "Token has expired or is invalid" in caplog.text
+    assert "123456" not in caplog.text
+    assert "student@dxb.manipal.edu" not in caplog.text.lower()
+
+
+def test_verify_omits_untrusted_provider_diagnostics(auth_backend, caplog):
+    from supabase_auth.errors import AuthApiError
+
+    client, provider = auth_backend
+    provider.auth.verify_otp.side_effect = AuthApiError("student@dxb.manipal.edu 123456 fake-secret", 400, "fake-secret")
+    assert client.post("/auth/verify", json={"email": "student@dxb.manipal.edu", "code": "123456"}).status_code == 401
+    assert "fake-secret" not in caplog.text
+    assert "123456" not in caplog.text
+    assert "student@dxb.manipal.edu" not in caplog.text
 
 
 def test_anon_client_disables_persistence(monkeypatch):
