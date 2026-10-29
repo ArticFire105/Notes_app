@@ -36,13 +36,19 @@
 
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { api, ApiError, clearSession, saveSession, setUserKey } from "../lib/api.ts";
+import { api, ApiError, clearSession, designMarkers, saveSession, setUserKey } from "../lib/api.ts";
 
 const originalFetch = globalThis.fetch;
 globalThis.window = new EventTarget();
 const session = { access_token: "fake-access", refresh_token: "fake-refresh", expires_at: 9999999999 };
 
 afterEach(() => { clearSession(); globalThis.fetch = originalFetch; });
+
+test("include and extend arrows point to the target and composition diamond marks the source", () => {
+  assert.deepEqual(designMarkers("extend"), { start: null, end: "arrow" });
+  assert.deepEqual(designMarkers("include"), { start: null, end: "arrow" });
+  assert.deepEqual(designMarkers("composition"), { start: "diamond", end: null });
+});
 
 test("production calls the same-origin API path", async () => {
   const previous = process.env.NODE_ENV;

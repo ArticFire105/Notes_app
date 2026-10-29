@@ -97,6 +97,10 @@ class AskRequest(BaseModel):
     history: list[ChatTurn] = Field(default_factory=list, max_length=6)
 
 
+class DesignRequest(AskRequest):
+    kind: Literal["usecase", "class", "wbs", "schedule"]
+
+
 
 
 class Usage(BaseModel):

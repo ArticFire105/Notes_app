@@ -52,6 +52,13 @@ export type PersonalNote = { id: string; subject_id: number; title: string; file
 export type Source = { figure_id?: string | null; source_type?: "official" | "personal"; document_id?: string | null; n: number; document: string; module: number | null; page: number; page_label?: string | null; score: number };
 export type Answer = { answer: string; sources: Source[]; remaining: number };
 export type Message = { role: "user" | "assistant"; content: string; sources?: Source[] };
+export type DesignKind = "usecase" | "class" | "wbs" | "schedule";
+export type DesignDiagram = { kind: DesignKind; title: string; nodes: { id: string; label: string; kind: "actor" | "usecase" | "class" | "task"; details: string[]; activity: string; resource: string; cost: string; duration: string; start: number; days: number }[]; edges: { source: string; target: string; kind: string }[] };
+export type DesignAnswer = { answer: string; diagram: DesignDiagram | null; sources: Source[]; remaining: number };
+export function designMarkers(kind: string) {
+  return { start: kind === "composition" ? "diamond" : kind === "aggregation" ? "open-diamond" : null,
+    end: ["include", "extend", "dependency", "generalization"].includes(kind) ? "arrow" : null };
+}
 
 let session: Session | null = null;
 let userKey = "";
@@ -241,6 +248,8 @@ export const api = {
     request<Answer>("/ask", { method: "POST", body: JSON.stringify({
       question, subject_id: subjectId, module_id: moduleId, document_id: documentId, mode, history: history.slice(-6).map(({ role, content, sources }) => ({ role, content: content.slice(0, 2000), sources: sources?.slice(0, 5) || [] })),
     }) }, true, true).then(value => { invalidateData("usage"); return value; }),
+  design: (question: string, subjectId: number, moduleId: number | null, documentId: string | null, mode: "normal" | "strict", kind: DesignKind) =>
+    request<DesignAnswer>("/design", { method: "POST", body: JSON.stringify({ question, subject_id: subjectId, module_id: moduleId, document_id: documentId, mode, kind }) }, true, true).then(value => { invalidateData("usage"); return value; }),
   worksheets: (subjectId: number) => request<Worksheet[]>(`/worksheets?subject_id=${subjectId}`),
   worksheet: (id: string) => request<WorksheetDetail>(`/worksheets/${id}`),
   uploadWorksheet: (data: FormData) => request<{ id: string }>("/worksheets", { method: "POST", body: data }, true, true),

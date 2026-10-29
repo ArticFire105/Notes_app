@@ -41,7 +41,8 @@ from app.auth import get_current_user, check_rate_limit
 from app.db import get_conn
 from app.llm import user_api_key
 from app.rag.answer import answer_question, answer_small_talk, is_small_talk
-from app.schemas import AskRequest, AskResponse
+from app.schemas import AskRequest, AskResponse, DesignRequest
+from app.rag.design import generate_design
 from app.routers.notes import has_note
 
 router = APIRouter()
@@ -116,5 +117,23 @@ def ask(request: AskRequest, user=Depends(get_current_user), api_key=Depends(use
             quota.record_usage(user["id"], **result["usage"], day=day)
     if key is not None:
         cache.put(key, request.subject_id, request.module_id, request.document_id, result)
+    return {**result, "remaining": quota.remaining(user["id"])}
+
+
+@router.post("/design")
+def design(request: DesignRequest, user=Depends(get_current_user), api_key=Depends(user_api_key)):
+    check_rate_limit(user["id"], "chat")
+    check_scope(request)
+    day = None
+    if api_key is None:
+        day = quota.dubai_day()
+        if not quota.try_consume(user["id"], day):
+            raise HTTPException(429, "Daily allowance reached. Add your own key in Settings or try later.")
+    result = generate_design(request, user["id"], api_key)
+    if api_key is None:
+        if not result["model_called"]:
+            quota.release_empty(user["id"], day)
+        else:
+            quota.record_usage(user["id"], **result["usage"], day=day)
     return {**result, "remaining": quota.remaining(user["id"])}
 

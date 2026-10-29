@@ -46,6 +46,47 @@ from app.config import Settings
 from app.rag import answer
 from app.rag.prompt import NOT_FOUND
 from scripts import ask, eval_retrieval
+from app.rag.design import DesignDiagram
+from pydantic import ValidationError
+
+
+def test_wbs_requires_all_box_fields_and_short_leaf():
+    node = {"id": "root", "label": "Project", "kind": "task", "activity": "Project", "resource": "Team", "cost": "TBD", "duration": "5 days", "days": 5}
+    diagram = {"kind": "wbs", "title": "Project", "nodes": [node], "edges": []}
+    assert DesignDiagram.model_validate(diagram).nodes[0].resource == "Team"
+    for field in ("activity", "resource", "cost", "duration"):
+        with pytest.raises(ValidationError):
+            DesignDiagram.model_validate({**diagram, "nodes": [{**node, field: ""}]})
+    with pytest.raises(ValidationError):
+        DesignDiagram.model_validate({**diagram, "nodes": [{**node, "days": 14}]})
+
+
+def test_design_strict_without_notes_does_not_call_model(monkeypatch):
+    from app.rag import design
+    monkeypatch.setattr(design, "retrieve", lambda *args, **kwargs: [])
+    monkeypatch.setattr(design, "Settings", lambda: SimpleNamespace(max_context_tokens=4000))
+    model = MagicMock()
+    monkeypatch.setattr(design, "get_chat_model", model)
+    request = SimpleNamespace(kind="wbs", question="Plan a project", subject_id=1, module_id=None, document_id=None, mode="strict")
+    result = design.generate_design(request, "user")
+    assert result["diagram"] is None
+    assert "Not found" in result["answer"]
+    model.assert_not_called()
+
+
+def test_design_keeps_extension_to_base_and_cites_notes(monkeypatch):
+    import json
+    from app.rag import design
+    hit = {"subject": "SE", "module": 1, "document": "Slides", "document_id": None, "page": 1, "content": "Extend points to the base.", "score": 0.9}
+    monkeypatch.setattr(design, "retrieve", lambda *args, **kwargs: [hit])
+    monkeypatch.setattr(design, "Settings", lambda: SimpleNamespace(max_context_tokens=4000))
+    data = {"answer": "Extend points to the base [1]. Beyond the notes: example.", "diagram": {"kind": "usecase", "title": "Store", "nodes": [{"id": "discount", "label": "Apply Discount Code", "kind": "usecase"}, {"id": "order", "label": "Place Order", "kind": "usecase"}], "edges": [{"source": "discount", "target": "order", "kind": "extend"}]}}
+    response = SimpleNamespace(content=json.dumps(data), usage_metadata={})
+    monkeypatch.setattr(design, "get_chat_model", lambda: SimpleNamespace(invoke=lambda messages: response))
+    request = SimpleNamespace(kind="usecase", question="Design a store", subject_id=1, module_id=None, document_id=None, mode="normal")
+    result = design.generate_design(request, "user")
+    assert result["diagram"]["edges"][0] == {"source": "discount", "target": "order", "kind": "extend"}
+    assert result["sources"][0]["page"] == 1
 
 
 @pytest.fixture(autouse=True)
